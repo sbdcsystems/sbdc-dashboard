@@ -144,6 +144,8 @@ function HeroFigure({ amount }) {
 // if 0 rows, strip common business suffixes and do a prefix LIKE search.
 
 async function fetchCustHistory(custName) {
+  console.log('[DEBUG] fetchCustHistory — querying for:', custName)
+
   const base = () =>
     supabase.from('sales_history')
       .select('sale_date, voucher_number, amount')
@@ -151,17 +153,21 @@ async function fetchCustHistory(custName) {
       .order('sale_date', { ascending: false })
       .limit(200)
 
-  const { data: exact } = await base().ilike('customer_name', custName)
+  const { data: exact, error: exactErr } = await base().ilike('customer_name', custName)
+  console.log('[DEBUG] ilike exact result — rows:', exact?.length ?? 0, '| error:', exactErr, '| data:', exact)
   if (exact && exact.length > 0) return exact
 
   const stem = custName
     .replace(/[\s,.]*\b(pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|&\s*co\.?|and\s+co\.?|company|traders?|trading|mills?|industries|enterprises?|exports?|works?|dyers?|textiles?)\s*\.?\s*$/i, '')
     .trim()
+  console.log('[DEBUG] stem after suffix strip:', stem, '| will fuzzy search:', stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase())
   if (stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase()) {
-    const { data: fuzzy } = await base().ilike('customer_name', `${stem}%`)
+    const { data: fuzzy, error: fuzzyErr } = await base().ilike('customer_name', `${stem}%`)
+    console.log('[DEBUG] fuzzy result — rows:', fuzzy?.length ?? 0, '| error:', fuzzyErr, '| data:', fuzzy)
     if (fuzzy && fuzzy.length > 0) return fuzzy
   }
 
+  console.log('[DEBUG] fetchCustHistory — no results found for:', custName)
   return []
 }
 
