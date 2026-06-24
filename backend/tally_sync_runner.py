@@ -859,26 +859,44 @@ def sync_today_sales(dry_run: bool = False):
     sales_total = 0.0
     sales_count = 0
     items       = []
+    seen_refs   = set()
+
     for v in vouchers:
         vtype = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype and "SALES" in vtype.group(1).upper()):
             continue
-        sales_count += 1
-        ref_m   = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
-        if ref_m and ref_m.group(1).strip().startswith("SO-"):
-            continue  # Sales Order duplicate — only count actual invoices (SBDC-)
-        amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+
+        ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
+        ref   = ref_m.group(1).strip() if ref_m else ""
+        if ref.startswith("SO-"):
+            continue  # skip Sales Order entries
+
+        amt_m = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        if not amt_m:
+            continue
+        try:
+            raw_amt = float(amt_m.group(1))
+        except ValueError:
+            continue
+
+        # Day Book returns one block per ledger entry for each voucher.
+        # The party (customer) entry is a DEBIT → AMOUNT is negative in Tally XML.
+        # Sales account and GST entries are CREDITs → AMOUNT is positive.
+        # Only the party entry carries the GST-inclusive invoice total.
+        if raw_amt >= 0:
+            continue  # skip sales account and GST credit entries
+
+        if ref in seen_refs:
+            continue  # dedup: each SBDC- number should only be counted once
+        seen_refs.add(ref)
+
         party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
-        amt = 0.0
-        if amt_m:
-            try:
-                amt = abs(float(amt_m.group(1)))
-            except ValueError:
-                pass
+        amt = abs(raw_amt)
         sales_total += amt
+        sales_count += 1
         items.append({
             "customer_name": html.unescape(party_m.group(1).strip()) if party_m else "",
-            "invoice_ref":   ref_m.group(1).strip() if ref_m else "",
+            "invoice_ref":   ref,
             "amount":        round(amt, 2),
         })
 

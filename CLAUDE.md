@@ -5,6 +5,15 @@ Python pipeline (Tally → Supabase) + Vite/React frontend.
 
 ---
 
+## Standing instructions for Claude
+
+- **New Supabase table**: add a `VERCEL ACTION NEEDED` reminder at the top of the response listing what SQL grants are needed, and add the table to the schema section below.
+- **New frontend env variable (`VITE_*`)**: add a `VERCEL ACTION NEEDED` reminder at the top of the response listing the variable name and value to add in Vercel → Project Settings → Environment Variables, and add it to the Vite env vars section below.
+
+Format: `VERCEL ACTION NEEDED: [exact action required]` — one line per item, at the very top of the response before any other content.
+
+---
+
 ## Project layout
 
 ```

@@ -657,20 +657,139 @@
   box-shadow: 0 0 0 1px var(--border);
 }
 
-/* ── Mobile adjustments ──────────────────────────────────────────────────── */
+/* ── Card date nav ───────────────────────────────────────────────────────── */
 
-@media (max-width: 560px) {
-  .frame { padding-left: 20px; }
-  .cust-table thead { display: none; }
-  .cust-table tbody td { display: block; padding: 4px 0; }
-  .cust-table tbody td.r { text-align: left; }
-  .cust-table tbody tr {
-    display: block;
-    padding: 12px 0;
-    border-bottom: 1px solid var(--border-soft);
-  }
-  .cust-table tbody tr:last-child { border-bottom: none; }
-  .cust-table tbody tr td:not(:first-child):not(:last-child) { display: none; }
+.card-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 18px;
+  align-items: center;
+}
+
+.card-nav-btn {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  height: 32px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.card-nav-btn:hover {
+  background: var(--border-soft);
+  color: var(--text-primary);
+}
+
+.card-nav-btn--active {
+  background: var(--indigo-soft);
+  color: var(--indigo);
+  border-color: var(--indigo);
+}
+
+.card-nav-datepicker {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  outline: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  min-width: 130px;
+}
+
+.card-nav-datepicker:focus {
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 3px var(--indigo-soft);
+}
+
+/* ── Card fade transition ─────────────────────────────────────────────────── */
+
+@keyframes card-fade {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.card-fade { animation: card-fade 0.18s ease; }
+
+/* ── Loading skeleton ─────────────────────────────────────────────────────── */
+
+@keyframes shimmer {
+  from { background-position: -200% 0; }
+  to   { background-position:  200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--border-soft) 25%, var(--border) 50%, var(--border-soft) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.2s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+.skeleton--figure {
+  height: 44px;
+  width: 200px;
+  margin-bottom: 12px;
+}
+
+.skeleton--line {
+  height: 16px;
+  width: 240px;
+}
+
+.card-skeleton { padding: 4px 0 8px; }
+
+/* ── Mobile (≤ 480px) ───────────────────────────────────────────────────── */
+
+@media (max-width: 480px) {
+
+  /* Layout */
+  .app   { padding: 24px 14px 60px; }
+  .frame { padding-left: 16px; }
+
+  /* Search bar — fill available width, no max-width cap */
+  .gsearch-wrap { max-width: 100%; }
+
+  /* Tabs — stretch to fill strip, large tap targets */
+  .tabs { width: 100%; }
+  .tab  { flex: 1; text-align: center; padding: 8px 6px; }
+
+  /* Hide columns tagged mobile-hide (Invoice ref, Type, Terms, Phone, Receipt ref) */
+  .mobile-hide { display: none !important; }
+
+  /* Staff rows — shrink fixed widths so progress bar gets room */
+  .staff-name-wrap { width: 76px; }
+  .staff-amt       { width: 68px; }
+
+  /* Customer detail header — stack avatar + name vertically */
+  .detail-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+
+  /* Aging/chart cards — prevent any child from forcing horizontal scroll */
+  .card--chart { overflow: hidden; }
+
+  /* Period switcher — wrap gracefully if needed */
+  .card-head { flex-wrap: wrap; }
+  .period-switcher { margin-left: 0; margin-top: 6px; }
+
+  /* Card nav — larger tap targets, full-width date picker */
+  .card-nav-btn { min-height: 44px; height: auto; padding: 10px 12px; }
+  .card-nav-datepicker { min-height: 44px; height: auto; width: 100%; min-width: 0; box-sizing: border-box; }
 }
 
 /* ── Global search ───────────────────────────────────────────────────────────── */

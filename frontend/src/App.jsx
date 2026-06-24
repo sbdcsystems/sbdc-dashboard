@@ -49,6 +49,39 @@ const FY_MONTHS_ELAPSED = (() => {
   return Math.max(1, (t.getUTCFullYear() - s.getUTCFullYear()) * 12 + t.getUTCMonth() - s.getUTCMonth() + 1)
 })()
 
+// ── Card date-nav helpers ──────────────────────────────────────────────────
+
+function _cardRange(period) {
+  if (period === 'yesterday') {
+    const d = _istNow(); d.setUTCDate(d.getUTCDate() - 1); const y = _fmtDate(d)
+    return { from: y, to: y }
+  }
+  if (period === 'this_week') {
+    const d = _istNow()
+    const dow = d.getUTCDay()
+    d.setUTCDate(d.getUTCDate() - (dow === 0 ? 6 : dow - 1))
+    return { from: _fmtDate(d), to: TODAY }
+  }
+  if (period === 'this_month') return { from: MONTH_START, to: TODAY }
+  return { from: TODAY, to: TODAY }
+}
+
+function _mergeCardRows(rows) {
+  if (!rows || rows.length === 0) return null
+  return {
+    total_amount:  rows.reduce((s, r) => s + (Number(r.total_amount) || 0), 0),
+    invoice_count: rows.reduce((s, r) => s + (r.invoice_count || 0), 0),
+    synced_at:     rows[rows.length - 1]?.synced_at ?? null,
+    items:         rows.flatMap(r => Array.isArray(r.items) ? r.items : []),
+  }
+}
+
+function _periodLabel(period, customDate) {
+  if (period === 'custom' && customDate)
+    return new Date(customDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+  return { today: 'today', yesterday: 'yesterday', this_week: 'this week', this_month: 'this month' }[period] || 'selected period'
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function getInitials(name) {
@@ -167,6 +200,17 @@ export default function App() {
   const [custDetail, setCustDetail]               = useState(null)
   const [custDetailLoading, setCustDetailLoading] = useState(false)
 
+  const [salesCardPeriod, setSalesCardPeriod] = useState('today')
+  const [salesCardLoading, setSalesCardLoading] = useState(false)
+  const [salesCardRows, setSalesCardRows] = useState(null)
+  const [salesPickerOpen, setSalesPickerOpen] = useState(false)
+  const [salesCustomDate, setSalesCustomDate] = useState('')
+  const [collCardPeriod, setCollCardPeriod] = useState('today')
+  const [collCardLoading, setCollCardLoading] = useState(false)
+  const [collCardRows, setCollCardRows] = useState(null)
+  const [collPickerOpen, setCollPickerOpen] = useState(false)
+  const [collCustomDate, setCollCustomDate] = useState('')
+
   // Auto-clear row highlight after 2.5 s
   useEffect(() => {
     if (!highlightedId) return
@@ -192,10 +236,6 @@ export default function App() {
           supabase.from('daily_sales').select('*').eq('sale_date', TODAY).maybeSingle(),
           supabase.from('daily_collections').select('*').eq('sale_date', TODAY).maybeSingle(),
         ])
-
-        console.log('[DEBUG] TODAY =', TODAY)
-        console.log('[DEBUG] daily_sales row =', salesRow, '| error =', e6)
-        console.log('[DEBUG] daily_collections row =', collectionsRow, '| error =', e7)
 
         if (e1) throw e1
         if (e2) throw e2
@@ -482,6 +522,48 @@ export default function App() {
     )
   }
 
+  async function handleSalesPeriod(period) {
+    setSalesCardPeriod(period)
+    if (period !== 'custom') setSalesPickerOpen(false)
+    if (period === 'today') { setSalesCardRows(null); return }
+    const { from, to } = _cardRange(period)
+    setSalesCardLoading(true)
+    const { data } = await supabase.from('daily_sales').select('*').gte('sale_date', from).lte('sale_date', to)
+    setSalesCardRows(data || [])
+    setSalesCardLoading(false)
+  }
+
+  async function handleSalesCustomDate(dateStr) {
+    setSalesCustomDate(dateStr)
+    if (!dateStr) return
+    setSalesCardPeriod('custom')
+    setSalesCardLoading(true)
+    const { data } = await supabase.from('daily_sales').select('*').eq('sale_date', dateStr)
+    setSalesCardRows(data || [])
+    setSalesCardLoading(false)
+  }
+
+  async function handleCollPeriod(period) {
+    setCollCardPeriod(period)
+    if (period !== 'custom') setCollPickerOpen(false)
+    if (period === 'today') { setCollCardRows(null); return }
+    const { from, to } = _cardRange(period)
+    setCollCardLoading(true)
+    const { data } = await supabase.from('daily_collections').select('*').gte('sale_date', from).lte('sale_date', to)
+    setCollCardRows(data || [])
+    setCollCardLoading(false)
+  }
+
+  async function handleCollCustomDate(dateStr) {
+    setCollCustomDate(dateStr)
+    if (!dateStr) return
+    setCollCardPeriod('custom')
+    setCollCardLoading(true)
+    const { data } = await supabase.from('daily_collections').select('*').eq('sale_date', dateStr)
+    setCollCardRows(data || [])
+    setCollCardLoading(false)
+  }
+
   function handleSearchResult(customer) {
     setGlobalSearch('')
     setSearchOpen(false)
@@ -513,10 +595,13 @@ export default function App() {
     setCustDetailLoading(false)
   }
 
-  const sortedSalesItems       = [...(todaySales?.items ?? [])].sort((a, b) => b.amount - a.amount)
+  const salesDisplayData = salesCardRows !== null ? _mergeCardRows(salesCardRows) : todaySales
+  const collDisplayData  = collCardRows  !== null ? _mergeCardRows(collCardRows)  : todayCollections
+
+  const sortedSalesItems       = [...(salesDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount)
   const visibleSalesItems      = showAllSales ? sortedSalesItems : sortedSalesItems.slice(0, 10)
   const salesHasDetail         = sortedSalesItems.some(i => i.customer_name || i.invoice_ref)
-  const sortedCollectionItems  = [...(todayCollections?.items ?? [])].sort((a, b) => b.amount - a.amount)
+  const sortedCollectionItems  = [...(collDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount)
   const collectionsHasDetail   = sortedCollectionItems.some(i => i.customer_name || i.invoice_ref)
 
   // ── Customer detail derived values ─────────────────────────────────────────
@@ -638,150 +723,223 @@ export default function App() {
                 <span className="chip chip--teal" />
                 <span className="card-label">Today's sales</span>
               </div>
-              {todaySales ? (
-                <>
-                  {/* Summary row */}
-                  <span className="sales-figure">{formatINR(todaySales.total_amount)}</span>
-                  <p className="hero-sub" style={{ marginTop: 8 }}>
-                    <strong>{todaySales.invoice_count}</strong>{' '}
-                    {todaySales.invoice_count === 1 ? 'invoice' : 'invoices'}
-                    &nbsp;&middot;&nbsp;
-                    synced {new Date(todaySales.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
-                  </p>
 
-                  {/* Per-invoice breakdown */}
-                  <div style={{ borderTop: '1px solid var(--border-soft)', margin: '18px 0 14px' }} />
-                  {salesHasDetail ? (
+              <div className="card-nav">
+                {[['today','Today'],['yesterday','Yesterday'],['this_week','This week'],['this_month','This month']].map(([p, lbl]) => (
+                  <button key={p} className={'card-nav-btn' + (salesCardPeriod === p ? ' card-nav-btn--active' : '')} onClick={() => handleSalesPeriod(p)}>{lbl}</button>
+                ))}
+                <button
+                  className={'card-nav-btn' + (salesCardPeriod === 'custom' ? ' card-nav-btn--active' : '')}
+                  onClick={() => setSalesPickerOpen(v => !v)}
+                >
+                  {salesCardPeriod === 'custom' && salesCustomDate
+                    ? new Date(salesCustomDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+                    : salesPickerOpen ? 'Less ▲' : 'More ▾'}
+                </button>
+                {salesPickerOpen && (
+                  <input
+                    type="date"
+                    className="card-nav-datepicker"
+                    value={salesCustomDate}
+                    max={TODAY}
+                    onChange={e => handleSalesCustomDate(e.target.value)}
+                  />
+                )}
+              </div>
+
+              {salesCardLoading ? (
+                <div className="card-skeleton">
+                  <div className="skeleton skeleton--figure" />
+                  <div className="skeleton skeleton--line" />
+                </div>
+              ) : (
+                <div key={salesCardPeriod + salesCustomDate} className="card-fade">
+                  {salesDisplayData ? (
                     <>
-                      <table className="cust-table">
-                        <thead>
-                          <tr>
-                            <th>Customer</th>
-                            <th>Invoice ref</th>
-                            <th>Handled by</th>
-                            <th>Type</th>
-                            <th className="r">Amount</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {visibleSalesItems.map((item, idx) => {
-                            const cid      = item.customer_id
-                            const nameKey  = item.customer_name?.trim().toLowerCase()
-                            const staff    = (cid != null ? staffById[cid]  : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
-                            const typeInfo = (cid != null ? typeById[cid]   : undefined) ?? typeByName[nameKey]
-                            const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
-                            return (
-                              <tr key={idx}>
-                                <td>
-                                  {cust
-                                    ? <span className="cust-name--link" onClick={() => openCustomer(cust, 'overview')}>{item.customer_name || '—'}</span>
-                                    : (item.customer_name || '—')}
-                                </td>
-                                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
-                                  {item.invoice_ref || '—'}
-                                </td>
-                                <td>{staff === 'Unassigned'
-                                  ? <span className="pill pill--unassigned">Unassigned</span>
-                                  : staff}
-                                </td>
-                                <td>
-                                  {typeInfo?.type === 'cash'
-                                    ? <span className="pill pill--cash">Cash</span>
-                                    : typeInfo?.type === 'credit'
-                                    ? <span className="pill pill--credit">Credit&nbsp;·&nbsp;{typeInfo.credit_days || '—'}d</span>
-                                    : '—'}
-                                </td>
-                                <td className="r">{formatINR(item.amount)}</td>
+                      <span className="sales-figure">{formatINR(salesDisplayData.total_amount)}</span>
+                      <p className="hero-sub" style={{ marginTop: 8 }}>
+                        <strong>{salesDisplayData.invoice_count}</strong>{' '}
+                        {salesDisplayData.invoice_count === 1 ? 'invoice' : 'invoices'}
+                        {['today', 'yesterday', 'custom'].includes(salesCardPeriod) && salesDisplayData.synced_at && (
+                          <>&nbsp;&middot;&nbsp;synced {new Date(salesDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}</>
+                        )}
+                      </p>
+                      <div style={{ borderTop: '1px solid var(--border-soft)', margin: '18px 0 14px' }} />
+                      {salesHasDetail ? (
+                        <>
+                          <table className="cust-table">
+                            <thead>
+                              <tr>
+                                <th>Customer</th>
+                                <th className="mobile-hide">Invoice ref</th>
+                                <th>Handled by</th>
+                                <th className="mobile-hide">Type</th>
+                                <th className="r">Amount</th>
                               </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
-                      {sortedSalesItems.length > 10 && (
-                        <button
-                          className="cust-subtotal__clear"
-                          style={{ marginTop: 12, display: 'block' }}
-                          onClick={() => setShowAllSales(v => !v)}
-                        >
-                          {showAllSales
-                            ? 'Show top 10'
-                            : `Show all ${sortedSalesItems.length} invoices`}
-                        </button>
+                            </thead>
+                            <tbody>
+                              {visibleSalesItems.map((item, idx) => {
+                                const cid      = item.customer_id
+                                const nameKey  = item.customer_name?.trim().toLowerCase()
+                                const staff    = (cid != null ? staffById[cid]  : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
+                                const typeInfo = (cid != null ? typeById[cid]   : undefined) ?? typeByName[nameKey]
+                                const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
+                                return (
+                                  <tr key={idx}>
+                                    <td>
+                                      {cust
+                                        ? <span className="cust-name--link" onClick={() => openCustomer(cust, 'overview')}>{item.customer_name || '—'}</span>
+                                        : (item.customer_name || '—')}
+                                    </td>
+                                    <td className="mobile-hide" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
+                                      {item.invoice_ref || '—'}
+                                    </td>
+                                    <td>{staff === 'Unassigned'
+                                      ? <span className="pill pill--unassigned">Unassigned</span>
+                                      : staff}
+                                    </td>
+                                    <td className="mobile-hide">
+                                      {typeInfo?.type === 'cash'
+                                        ? <span className="pill pill--cash">Cash</span>
+                                        : typeInfo?.type === 'credit'
+                                        ? <span className="pill pill--credit">Credit&nbsp;·&nbsp;{typeInfo.credit_days || '—'}d</span>
+                                        : '—'}
+                                    </td>
+                                    <td className="r">{formatINR(item.amount)}</td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                          {sortedSalesItems.length > 10 && (
+                            <button
+                              className="cust-subtotal__clear"
+                              style={{ marginTop: 12, display: 'block' }}
+                              onClick={() => setShowAllSales(v => !v)}
+                            >
+                              {showAllSales ? 'Show top 10' : `Show all ${sortedSalesItems.length} invoices`}
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <p className="hero-sub">Per-invoice breakdown not available from this Tally export</p>
                       )}
                     </>
                   ) : (
                     <p className="hero-sub">
-                      Per-invoice breakdown not available from this Tally export
+                      {salesCardPeriod === 'today'
+                        ? "No data yet — sync hasn't run today"
+                        : `No data for ${_periodLabel(salesCardPeriod, salesCustomDate)}`}
                     </p>
                   )}
-                </>
-              ) : (
-                <p className="hero-sub">No data yet — sync hasn't run today</p>
+                </div>
               )}
             </div>
 
-            {/* Collections today */}
+            {/* Collections */}
             <div className="card" style={{ marginBottom: 28 }}>
               <div className="card-head">
                 <span className="chip chip--indigo" />
                 <span className="card-label">Collections today</span>
               </div>
-              {todayCollections ? (
-                todayCollections.invoice_count === 0 ? (
-                  <p className="hero-sub">No collections received today</p>
-                ) : (
-                  <>
-                    <span className="sales-figure">{formatINR(todayCollections.total_amount)}</span>
-                    <p className="hero-sub" style={{ marginTop: 8 }}>
-                      <strong>{todayCollections.invoice_count}</strong>{' '}
-                      {todayCollections.invoice_count === 1 ? 'receipt' : 'receipts'}
-                      &nbsp;&middot;&nbsp;
-                      synced {new Date(todayCollections.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
-                    </p>
-                    <div style={{ borderTop: '1px solid var(--border-soft)', margin: '18px 0 14px' }} />
-                    {collectionsHasDetail ? (
-                      <table className="cust-table">
-                        <thead>
-                          <tr>
-                            <th>Customer</th>
-                            <th>Receipt ref</th>
-                            <th>Handled by</th>
-                            <th className="r">Amount</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {sortedCollectionItems.map((item, idx) => {
-                            const cid      = item.customer_id
-                            const nameKey  = item.customer_name?.trim().toLowerCase()
-                            const staff    = (cid != null ? staffById[cid] : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
-                            const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
-                            return (
-                              <tr key={idx}>
-                                <td>
-                                  {cust
-                                    ? <span className="cust-name--link" onClick={() => openCustomer(cust, 'overview')}>{item.customer_name || '—'}</span>
-                                    : (item.customer_name || '—')}
-                                </td>
-                                <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
-                                  {item.invoice_ref || '—'}
-                                </td>
-                                <td>{staff === 'Unassigned'
-                                  ? <span className="pill pill--unassigned">Unassigned</span>
-                                  : staff}
-                                </td>
-                                <td className="r">{formatINR(item.amount)}</td>
-                              </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
-                    ) : (
-                      <p className="hero-sub">Per-receipt breakdown not available from this Tally export</p>
-                    )}
-                  </>
-                )
+
+              <div className="card-nav">
+                {[['today','Today'],['yesterday','Yesterday'],['this_week','This week'],['this_month','This month']].map(([p, lbl]) => (
+                  <button key={p} className={'card-nav-btn' + (collCardPeriod === p ? ' card-nav-btn--active' : '')} onClick={() => handleCollPeriod(p)}>{lbl}</button>
+                ))}
+                <button
+                  className={'card-nav-btn' + (collCardPeriod === 'custom' ? ' card-nav-btn--active' : '')}
+                  onClick={() => setCollPickerOpen(v => !v)}
+                >
+                  {collCardPeriod === 'custom' && collCustomDate
+                    ? new Date(collCustomDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+                    : collPickerOpen ? 'Less ▲' : 'More ▾'}
+                </button>
+                {collPickerOpen && (
+                  <input
+                    type="date"
+                    className="card-nav-datepicker"
+                    value={collCustomDate}
+                    max={TODAY}
+                    onChange={e => handleCollCustomDate(e.target.value)}
+                  />
+                )}
+              </div>
+
+              {collCardLoading ? (
+                <div className="card-skeleton">
+                  <div className="skeleton skeleton--figure" />
+                  <div className="skeleton skeleton--line" />
+                </div>
               ) : (
-                <p className="hero-sub">No collections yet today — sync hasn't run</p>
+                <div key={collCardPeriod + collCustomDate} className="card-fade">
+                  {collDisplayData ? (
+                    collDisplayData.invoice_count === 0 ? (
+                      <p className="hero-sub">
+                        {collCardPeriod === 'today'
+                          ? 'No collections received today'
+                          : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
+                      </p>
+                    ) : (
+                      <>
+                        <span className="sales-figure">{formatINR(collDisplayData.total_amount)}</span>
+                        <p className="hero-sub" style={{ marginTop: 8 }}>
+                          <strong>{collDisplayData.invoice_count}</strong>{' '}
+                          {collDisplayData.invoice_count === 1 ? 'receipt' : 'receipts'}
+                          {['today', 'yesterday', 'custom'].includes(collCardPeriod) && collDisplayData.synced_at && (
+                            <>&nbsp;&middot;&nbsp;synced {new Date(collDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}</>
+                          )}
+                        </p>
+                        <div style={{ borderTop: '1px solid var(--border-soft)', margin: '18px 0 14px' }} />
+                        {collectionsHasDetail ? (
+                          <table className="cust-table">
+                            <thead>
+                              <tr>
+                                <th>Customer</th>
+                                <th className="mobile-hide">Receipt ref</th>
+                                <th>Handled by</th>
+                                <th className="r">Amount</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {sortedCollectionItems.map((item, idx) => {
+                                const cid      = item.customer_id
+                                const nameKey  = item.customer_name?.trim().toLowerCase()
+                                const staff    = (cid != null ? staffById[cid] : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
+                                const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
+                                return (
+                                  <tr key={idx}>
+                                    <td>
+                                      {cust
+                                        ? <span className="cust-name--link" onClick={() => openCustomer(cust, 'overview')}>{item.customer_name || '—'}</span>
+                                        : (item.customer_name || '—')}
+                                    </td>
+                                    <td className="mobile-hide" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
+                                      {item.invoice_ref || '—'}
+                                    </td>
+                                    <td>{staff === 'Unassigned'
+                                      ? <span className="pill pill--unassigned">Unassigned</span>
+                                      : staff}
+                                    </td>
+                                    <td className="r">{formatINR(item.amount)}</td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        ) : (
+                          <p className="hero-sub">Per-receipt breakdown not available from this Tally export</p>
+                        )}
+                      </>
+                    )
+                  ) : (
+                    <p className="hero-sub">
+                      {collCardPeriod === 'today'
+                        ? "No collections yet today — sync hasn't run"
+                        : `No data for ${_periodLabel(collCardPeriod, collCustomDate)}`}
+                    </p>
+                  )}
+                </div>
               )}
             </div>
 
@@ -1063,10 +1221,10 @@ export default function App() {
               <thead>
                 <tr>
                   <th>Customer</th>
-                  <th>Assigned to</th>
-                  <th>Terms</th>
+                  <th className="mobile-hide">Assigned to</th>
+                  <th className="mobile-hide">Terms</th>
                   <th className="r">Present due</th>
-                  <th className="r">Phone</th>
+                  <th className="r mobile-hide">Phone</th>
                 </tr>
               </thead>
               <tbody>
@@ -1097,12 +1255,12 @@ export default function App() {
                         </div>
                       </div>
                     </td>
-                    <td>
+                    <td className="mobile-hide">
                       {c.assigned_to_name
                         ? c.assigned_to_name
                         : <span className="pill pill--unassigned">Unassigned</span>}
                     </td>
-                    <td>
+                    <td className="mobile-hide">
                       {c.customer_type === 'cash'
                         ? <span className="pill pill--cash">Cash</span>
                         : <span className="pill pill--credit">
@@ -1112,7 +1270,7 @@ export default function App() {
                     <td className="r">
                       {c.present_pending > 0 ? formatINR(c.present_pending) : '—'}
                     </td>
-                    <td className="r">{c.phone || '—'}</td>
+                    <td className="r mobile-hide">{c.phone || '—'}</td>
                   </tr>
                 ))}
               </tbody>
