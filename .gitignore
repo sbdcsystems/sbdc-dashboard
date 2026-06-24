@@ -1,0 +1,38 @@
+# Environment — never commit credentials
+.env
+.env.local
+.env.*.local
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Backend generated / sensitive files
+backend/logs/
+backend/*.xml
+backend/*.zip
+backend.zip
+backend/last_sync_status.json
+backend/parsed_outstanding.json
+backend/ledger_master_parsed.json
+backend/*.txt
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
