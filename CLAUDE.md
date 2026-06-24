@@ -169,13 +169,16 @@ Tally must be open and the correct company active before running a live sync.
 |---|---|---|
 | voucher_number | text UNIQUE | e.g. `SBDC-1234/26-27` |
 | sale_date | date | |
-| customer_name | text | |
+| customer_name | text | raw Tally PARTYLEDGERNAME — may differ in casing from customers table |
+| customer_id | uuid FK→customers.id | nullable; stamped by Step 10. Requires: `ALTER TABLE sales_history ADD COLUMN IF NOT EXISTS customer_id uuid REFERENCES customers(id);` |
 | amount | numeric | nullable (some Tally vouchers have no parseable amount) |
 | stock_item | text | |
 | quantity | numeric | |
 | rate | numeric | |
 | voucher_type | text | |
 | synced_at | timestamptz | |
+
+**Name-drift fix**: `sales_history.customer_name` is the raw Tally `PARTYLEDGERNAME` and often differs in casing from `customers.customer_name`. Frontend fetches by `.ilike()` (case-insensitive) with a fuzzy suffix-strip fallback. Backend stamps `customer_id` UUID in Step 10 — once populated, frontend can switch to UUID-primary lookup.
 
 ### Views (read-only, used by dashboard)
 | View | Purpose |

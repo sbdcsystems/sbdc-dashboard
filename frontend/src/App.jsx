@@ -138,6 +138,33 @@ function HeroFigure({ amount }) {
   return <span className="hero-figure">{formatINR(animated)}</span>
 }
 
+// ── Customer history fetch — ilike + fuzzy fallback ─────────────────────────
+// sales_history stores raw Tally PARTYLEDGERNAME which may differ in case
+// from customers.customer_name. Try case-insensitive exact match first;
+// if 0 rows, strip common business suffixes and do a prefix LIKE search.
+
+async function fetchCustHistory(custName) {
+  const base = () =>
+    supabase.from('sales_history')
+      .select('sale_date, voucher_number, amount')
+      .gte('sale_date', FY_START)
+      .order('sale_date', { ascending: false })
+      .limit(200)
+
+  const { data: exact } = await base().ilike('customer_name', custName)
+  if (exact && exact.length > 0) return exact
+
+  const stem = custName
+    .replace(/[\s,.]*\b(pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|&\s*co\.?|and\s+co\.?|company|traders?|trading|mills?|industries|enterprises?|exports?|works?|dyers?|textiles?)\s*\.?\s*$/i, '')
+    .trim()
+  if (stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase()) {
+    const { data: fuzzy } = await base().ilike('customer_name', `${stem}%`)
+    if (fuzzy && fuzzy.length > 0) return fuzzy
+  }
+
+  return []
+}
+
 // ── Rating algorithm ─────────────────────────────────────────────────────────
 
 function computeRating(bills, history, fyMedian, monthsElapsed) {
@@ -579,19 +606,14 @@ export default function App() {
     setCustDetail(null)
     setCustDetailLoading(true)
     setView('customer-detail')
-    const [{ data: bills }, { data: history }] = await Promise.all([
+    const [{ data: bills }, history] = await Promise.all([
       supabase.from('outstanding')
         .select('invoice_date, invoice_ref, pending_amount, days_overdue, age_status, bucket')
         .eq('customer_id', customer.id)
         .order('invoice_date', { ascending: true }),
-      supabase.from('sales_history')
-        .select('sale_date, voucher_number, amount')
-        .eq('customer_name', customer.customer_name)
-        .gte('sale_date', FY_START)
-        .order('sale_date', { ascending: false })
-        .limit(200),
+      fetchCustHistory(customer.customer_name),
     ])
-    setCustDetail({ bills: bills || [], history: history || [] })
+    setCustDetail({ bills: bills || [], history })
     setCustDetailLoading(false)
   }
 

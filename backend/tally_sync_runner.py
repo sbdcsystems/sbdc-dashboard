@@ -1236,6 +1236,36 @@ def sync_sales_history(dry_run: bool = False):
         os.environ["SUPABASE_URL"],
         os.environ["SUPABASE_SECRET_KEY"],
     )
+
+    # Stamp customer_id UUID onto each record — same pattern as sync_today_sales.
+    # Requires: ALTER TABLE sales_history ADD COLUMN IF NOT EXISTS customer_id uuid REFERENCES customers(id);
+    cust_id_map = {}
+    offset = 0
+    while True:
+        batch = (
+            supa.table("customers")
+            .select("id, customer_name")
+            .range(offset, offset + 999)
+            .execute().data
+        )
+        for row in batch:
+            cust_id_map[row["customer_name"].strip().lower()] = row["id"]
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    matched_uuid = 0
+    for rec in all_records:
+        cname = (rec.get("customer_name") or "").strip().lower()
+        cid   = cust_id_map.get(cname)
+        rec["customer_id"] = cid
+        if cid:
+            matched_uuid += 1
+    log.info(
+        "  UUID resolved: %d / %d records (%d unmatched — name variation or new customer)",
+        matched_uuid, len(all_records), len(all_records) - matched_uuid,
+    )
+
     upserted = 0
     for i in range(0, len(all_records), SUPABASE_BATCH):
         batch = all_records[i : i + SUPABASE_BATCH]
