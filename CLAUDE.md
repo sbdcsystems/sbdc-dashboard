@@ -257,3 +257,5 @@ _STAFF_GROUPS = {
 | Sumeet (user) | Builder | Owner's child, final-year AIML student |
 
 Former staff (Vetri, Levaset, Kanagaraj) — their Tally groups map to Vijaya Priya in the assignment system.
+
+<!-- last updated: 2026-06-24 -->
