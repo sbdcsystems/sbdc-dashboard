@@ -913,7 +913,7 @@ def sync_today_sales(dry_run: bool = False):
 
     if dry_run:
         log.info("  DRY RUN — daily_sales upsert skipped")
-        return
+        return sales_count, round(sales_total, 2)
 
     supa = create_client(
         os.environ["SUPABASE_URL"],
@@ -960,6 +960,7 @@ def sync_today_sales(dry_run: bool = False):
         on_conflict="sale_date",
     ).execute()
     log.info("  daily_sales upserted for %s", today.isoformat())
+    return sales_count, round(sales_total, 2)
 
 
 # ── Step 9b: Today's collections (Receipt vouchers) → daily_collections ──────
@@ -1226,11 +1227,15 @@ def sync_sales_history(dry_run: bool = False):
 
     if not all_records:
         log.warning("  No sales records found — skipping upsert")
-        return
+        return 0.0
+
+    today_iso   = today.isoformat()
+    today_total = round(sum(r["amount"] for r in all_records if r.get("sale_date") == today_iso), 2)
+    log.info("  Step 10 — today's slice total: Rs %s", f"{today_total:,.2f}")
 
     if dry_run:
         log.info("  DRY RUN — sales_history upsert skipped")
-        return
+        return today_total
 
     supa = create_client(
         os.environ["SUPABASE_URL"],
@@ -1273,6 +1278,144 @@ def sync_sales_history(dry_run: bool = False):
         upserted += len(batch)
         log.info("  Upserted %d / %d", upserted, len(all_records))
     log.info("  sales_history sync complete")
+    return today_total
+
+
+# ── Reconciliation ─────────────────────────────────────────────────────────────
+
+def _fetch_tally_voucher_count(date_str: str) -> int:
+    """
+    Lightweight second Tally request — fetches only VOUCHERNUMBER+VOUCHERTYPENAME
+    for the date to get an independent count of SALES vouchers (excluding SO-).
+    """
+    xml_body = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>SalesCountCheck</ID>"
+        "</HEADER>"
+        "<BODY><DESC>"
+        "<STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"<SVFROMDATE>{date_str}</SVFROMDATE>"
+        f"<SVTODATE>{date_str}</SVTODATE>"
+        "</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        '<COLLECTION NAME="SalesCountCheck" ISMODIFY="No">'
+        "<TYPE>Voucher</TYPE>"
+        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
+        "<FETCH>VOUCHERNUMBER, VOUCHERTYPENAME</FETCH>"
+        "</COLLECTION>"
+        "</TDLMESSAGE></TDL>"
+        "</DESC></BODY>"
+        "</ENVELOPE>"
+    )
+    r   = requests.post(
+        TALLY_URL, data=xml_body.encode("utf-8"),
+        headers={"Content-Type": "text/xml"}, timeout=30,
+    )
+    xml   = r.content.decode("utf-8", errors="replace")
+    count = 0
+    for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
+        vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+        if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
+            continue
+        ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
+        ref   = ref_m.group(1).strip() if ref_m else ""
+        if not ref or ref.startswith("SO-"):
+            continue
+        count += 1
+    return count
+
+
+def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fetched_count: int):
+    """
+    Post-sync safety check (non-fatal — caller must catch exceptions):
+    1. Voucher count: re-fetches count from Tally independently and compares
+       against fetched_count. Retries once on mismatch; raises RuntimeError
+       if still mismatched after retry.
+    2. Step 9 vs Step 10 cross-check: if totals differ by more than ₹1,
+       logs a per-voucher mismatch report pulling from daily_sales + sales_history.
+    Log format:
+      [RECONCILE] Date: {date} | Vouchers: {fetched}/{tally} | Step9: ₹{x} | Step10: ₹{y} | STATUS: OK/MISMATCH
+    """
+    date_str = sync_date.strftime("%Y%m%d")
+
+    # ── 1. Voucher count check ────────────────────────────────────────────────
+    tally_count = None
+    count_ok    = True
+    try:
+        tally_count = _fetch_tally_voucher_count(date_str)
+        if tally_count != fetched_count:
+            log.warning(
+                "[RECONCILE] Count mismatch — fetched %d, Tally reports %d — retrying",
+                fetched_count, tally_count,
+            )
+            tally_count = _fetch_tally_voucher_count(date_str)
+            if tally_count != fetched_count:
+                count_ok = False
+                log.error(
+                    "[RECONCILE] Count still mismatched after retry (fetched=%d, tally=%d)",
+                    fetched_count, tally_count,
+                )
+    except Exception as exc:
+        log.warning("[RECONCILE] Could not fetch Tally count: %s", exc)
+
+    # ── 2. Step 9 vs Step 10 total cross-check ───────────────────────────────
+    diff     = abs(step9_total - step10_total)
+    total_ok = diff <= 1.0
+    status   = "OK" if (count_ok and total_ok) else "MISMATCH"
+
+    log.info(
+        "[RECONCILE] Date: %s | Vouchers: %d/%s | Step9: ₹%s | Step10: ₹%s | STATUS: %s",
+        sync_date.isoformat(),
+        fetched_count,
+        str(tally_count) if tally_count is not None else "?",
+        f"{step9_total:,.2f}",
+        f"{step10_total:,.2f}",
+        status,
+    )
+
+    if not total_ok:
+        log.warning(
+            "[RECONCILE] MISMATCH DETAIL — Step9 vs Step10 differ by ₹%s for %s",
+            f"{diff:,.2f}", sync_date.isoformat(),
+        )
+        try:
+            supa      = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+            s9_resp   = supa.table("daily_sales").select("items").eq("sale_date", sync_date.isoformat()).execute()
+            s9_items  = (s9_resp.data[0] if s9_resp.data else {}).get("items") or []
+
+            s10_resp     = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
+            s10_by_ref   = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
+
+            s9_refs = set()
+            for item in s9_items:
+                ref    = item.get("invoice_ref") or ""
+                s9_amt = float(item.get("amount") or 0)
+                s9_refs.add(ref)
+                s10_amt = s10_by_ref.get(ref)
+                if s10_amt is None:
+                    log.warning("[RECONCILE]   %s — Step9: ₹%s | Step10: NOT FOUND", ref, f"{s9_amt:,.2f}")
+                elif abs(s9_amt - s10_amt) > 1:
+                    log.warning(
+                        "[RECONCILE]   %s — Step9: ₹%s | Step10: ₹%s | Diff: ₹%s",
+                        ref, f"{s9_amt:,.2f}", f"{s10_amt:,.2f}", f"{abs(s9_amt - s10_amt):,.2f}",
+                    )
+            for ref, s10_amt in s10_by_ref.items():
+                if ref not in s9_refs:
+                    log.warning("[RECONCILE]   %s — Step9: NOT FOUND | Step10: ₹%s", ref, f"{s10_amt:,.2f}")
+        except Exception as exc:
+            log.warning("[RECONCILE] Could not fetch per-voucher detail: %s", exc)
+
+    if not count_ok:
+        raise RuntimeError(
+            f"[RECONCILE] Voucher count mismatch for {sync_date}: "
+            f"fetched={fetched_count}, tally={tally_count}"
+        )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1340,9 +1483,10 @@ def main():
             log.warning("  Sending skip alert for %d unmatched customer(s)", len(unmatched))
             _send_skip_alert_email(unmatched)
 
+        step9_count, step9_total, step10_today = 0, 0.0, 0.0
         if not from_local:
             try:
-                sync_today_sales(dry_run=dry_run)
+                step9_count, step9_total = sync_today_sales(dry_run=dry_run)
             except Exception as exc:
                 log.warning("Step 9 WARNING — Today's sales sync failed (non-fatal): %s", exc)
 
@@ -1354,9 +1498,15 @@ def main():
 
         if not from_local:
             try:
-                sync_sales_history(dry_run=dry_run)
+                step10_today = sync_sales_history(dry_run=dry_run) or 0.0
             except Exception as exc:
                 log.warning("Step 10 WARNING — Sales history sync failed (non-fatal): %s", exc)
+
+        if not from_local and not dry_run:
+            try:
+                reconcile_sync(date.today(), step9_total, step10_today, step9_count)
+            except Exception as exc:
+                log.warning("RECONCILE WARNING — Post-sync check failed (non-fatal): %s", exc)
 
         log.info("=" * 60)
         log.info("SYNC COMPLETE%s", " (DRY RUN)" if dry_run else "")
