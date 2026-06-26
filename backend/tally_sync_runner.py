@@ -2,9 +2,12 @@
 tally_sync_runner.py — automated Tally -> Supabase outstanding sync.
 
 Modes:
-  python tally_sync_runner.py                         # full sync (requires office network)
-  python tally_sync_runner.py --from-local            # skip Tally fetch, use existing tally_with_dates.xml
-  python tally_sync_runner.py --from-local --dry-run  # parse + map only, no DB changes
+  python tally_sync_runner.py                                            # full sync (requires office network)
+  python tally_sync_runner.py --from-local                              # skip Tally fetch, use existing tally_with_dates.xml
+  python tally_sync_runner.py --from-local --dry-run                    # parse + map only, no DB changes
+  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30   # backfill daily_sales + collections
+  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --force  # overwrite existing rows
+  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --dry-run  # preview without writes
 
 Safety guarantees:
   - Old data is only deleted AFTER new data is fully inserted (insert-first pattern).
@@ -20,6 +23,7 @@ Email config (optional, add to root .env):
   NOTIFY_EMAIL=number.to.notify@gmail.com
 """
 
+import argparse
 import os
 import json
 import re
@@ -826,16 +830,15 @@ def reload_supabase(bills: list, dry_run: bool = False):
 
 # ── Step 9: Today's sales from Day Book ───────────────────────────────────────
 
-def sync_today_sales(dry_run: bool = False):
+def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
     """
-    Fetch today's sales from Tally using the same TDL Collection request as
-    sync_sales_history — returns exactly one record per voucher, no ledger-entry
-    ambiguity. Upserts total + count to daily_sales.
+    Fetch sales for target_date (defaults to today) using TDL Collection —
+    one record per voucher, no ledger-entry ambiguity. Upserts to daily_sales.
     Caller should catch exceptions (non-fatal).
     """
-    today     = date.today()
+    today     = target_date or date.today()
     today_str = today.strftime("%Y%m%d")
-    log.info("Step 9 — Fetching today's sales (TDL Collection)")
+    log.info("Step 9 — Fetching sales for %s (TDL Collection)", today.isoformat())
 
     xml_body = (
         "<ENVELOPE>"
@@ -965,15 +968,14 @@ def sync_today_sales(dry_run: bool = False):
 
 # ── Step 9b: Today's collections (Receipt vouchers) → daily_collections ──────
 
-def sync_today_collections(dry_run: bool = False):
+def sync_today_collections(dry_run: bool = False, target_date: "date | None" = None):
     """
-    Fetch today's Receipt vouchers from the Day Book and upsert to
-    daily_collections. Same XML request as sync_today_sales — filtered on
-    VOUCHERTYPENAME = 'Receipt'. Caller should catch exceptions (non-fatal).
+    Fetch Receipt vouchers for target_date (defaults to today) and upsert to
+    daily_collections. Caller should catch exceptions (non-fatal).
     """
-    today     = date.today()
+    today     = target_date or date.today()
     today_str = today.strftime("%Y%m%d")
-    log.info("Step 9b — Fetching today's collections (Day Book — Receipt vouchers)")
+    log.info("Step 9b — Fetching collections for %s (Day Book — Receipt vouchers)", today.isoformat())
 
     xml_body = (
         "<ENVELOPE>"
@@ -1418,12 +1420,119 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
         )
 
 
+# ── Backfill ───────────────────────────────────────────────────────────────────
+
+def backfill_mode(from_date: date, to_date: date, force: bool, dry_run: bool):
+    """
+    Backfill daily_sales and daily_collections for every date in [from_date, to_date].
+    Skips dates that already have a daily_sales row unless force=True.
+    Does NOT re-run Steps 1-8 (outstanding) or Step 10 (sales_history) — those
+    are not date-scoped in the same way.
+    """
+    total_days = (to_date - from_date).days + 1
+    log.info(
+        "[BACKFILL] Range: %s → %s | %d day(s) | force=%s | dry_run=%s",
+        from_date.isoformat(), to_date.isoformat(), total_days, force, dry_run,
+    )
+
+    # Pre-fetch which dates already have daily_sales rows in one query
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+    resp = (
+        supa.table("daily_sales")
+        .select("sale_date")
+        .gte("sale_date", from_date.isoformat())
+        .lte("sale_date", to_date.isoformat())
+        .execute()
+    )
+    existing = {r["sale_date"] for r in (resp.data or [])}
+    log.info("[BACKFILL] %d date(s) already have daily_sales data", len(existing))
+
+    synced = 0
+    skipped = 0
+    current = from_date
+
+    while current <= to_date:
+        date_str = current.isoformat()
+        idx      = synced + skipped + 1
+
+        if date_str in existing and not force:
+            log.info(
+                "[BACKFILL] %s (%d/%d) — SKIP (already synced; use --force to overwrite)",
+                date_str, idx, total_days,
+            )
+            skipped += 1
+            current += timedelta(days=1)
+            continue
+
+        log.info("[BACKFILL] %s (%d/%d) — syncing...", date_str, idx, total_days)
+
+        try:
+            count, total = sync_today_sales(dry_run=dry_run, target_date=current)
+            log.info(
+                "[BACKFILL] %s — sales: %d invoice(s), Rs %s",
+                date_str, count, f"{total:,.2f}",
+            )
+        except Exception as exc:
+            log.warning("[BACKFILL] %s — sales sync failed: %s", date_str, exc)
+
+        try:
+            sync_today_collections(dry_run=dry_run, target_date=current)
+            log.info("[BACKFILL] %s — collections done", date_str)
+        except Exception as exc:
+            log.warning("[BACKFILL] %s — collections sync failed: %s", date_str, exc)
+
+        synced += 1
+        current += timedelta(days=1)
+
+    log.info(
+        "[BACKFILL] Finished — %d synced, %d skipped, %d total",
+        synced, skipped, total_days,
+    )
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    dry_run    = "--dry-run"    in sys.argv
-    from_local = "--from-local" in sys.argv
+    parser = argparse.ArgumentParser(description="SBDC Tally → Supabase sync")
+    parser.add_argument("--dry-run",    action="store_true", help="Parse without DB writes")
+    parser.add_argument("--from-local", action="store_true", help="Use tally_with_dates.xml instead of live Tally")
+    parser.add_argument("--backfill",   action="store_true", help="Backfill daily_sales/collections for a date range")
+    parser.add_argument("--from",       dest="from_date", metavar="YYYY-MM-DD", help="Backfill start date (inclusive)")
+    parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
+    parser.add_argument("--force",      action="store_true", help="Overwrite existing rows in --backfill mode")
+    args = parser.parse_args()
 
+    dry_run    = args.dry_run
+    from_local = args.from_local
+
+    # ── Backfill mode ─────────────────────────────────────────────────────────
+    if args.backfill:
+        if not args.from_date or not args.to_date:
+            parser.error("--backfill requires --from YYYY-MM-DD and --to YYYY-MM-DD")
+        try:
+            from_date = date.fromisoformat(args.from_date)
+            to_date   = date.fromisoformat(args.to_date)
+        except ValueError as exc:
+            parser.error(f"Invalid date: {exc}")
+        if from_date > to_date:
+            parser.error("--from date must be on or before --to date")
+
+        log.info("=" * 60)
+        log.info("SUPREME BALAJI — BACKFILL MODE")
+        log.info("  Range : %s → %s", args.from_date, args.to_date)
+        log.info("  Force : %s", args.force)
+        if dry_run: log.info("  DRY RUN — no DB writes")
+        log.info("  Run   : %s", RUN_TS)
+        log.info("=" * 60)
+
+        try:
+            backfill_mode(from_date, to_date, force=args.force, dry_run=dry_run)
+        except Exception as exc:
+            log.exception("BACKFILL FAILED: %s", exc)
+            sys.exit(1)
+        return
+
+    # ── Normal sync mode ──────────────────────────────────────────────────────
     log.info("=" * 60)
     log.info("SUPREME BALAJI — TALLY OUTSTANDING SYNC")
     if from_local: log.info("  MODE: FROM LOCAL FILE (no Tally connection)")
