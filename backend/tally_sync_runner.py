@@ -883,7 +883,7 @@ def sync_today_sales(dry_run: bool = False):
         # The party (customer) entry is a DEBIT → AMOUNT is negative in Tally XML.
         # Sales account and GST entries are CREDITs → AMOUNT is positive.
         # Only the party entry carries the GST-inclusive invoice total.
-        if raw_amt >= 0:
+        if raw_amt <= 0:
             continue  # skip sales account and GST credit entries
 
         if ref in seen_refs:
