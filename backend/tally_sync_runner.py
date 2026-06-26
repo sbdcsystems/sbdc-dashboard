@@ -5,8 +5,9 @@ Modes:
   python tally_sync_runner.py                                            # full sync (requires office network)
   python tally_sync_runner.py --from-local                              # skip Tally fetch, use existing tally_with_dates.xml
   python tally_sync_runner.py --from-local --dry-run                    # parse + map only, no DB changes
-  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30   # backfill daily_sales + collections
-  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --force  # overwrite existing rows
+  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30            # backfill day-by-day
+  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --by-month  # one request/month (faster)
+  python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --force    # overwrite existing rows
   python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --dry-run  # preview without writes
 
 Safety guarantees:
@@ -1422,20 +1423,105 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
 
 # ── Backfill ───────────────────────────────────────────────────────────────────
 
-def backfill_mode(from_date: date, to_date: date, force: bool, dry_run: bool):
+def _fetch_month_vouchers(from_str: str, to_str: str, vtype_filter: str) -> list:
     """
-    Backfill daily_sales and daily_collections for every date in [from_date, to_date].
+    One TDL Collection request covering a date range.
+    vtype_filter: 'SALES' or 'RECEIPT' — matched against VOUCHERTYPENAME.
+    Returns [{sale_date (ISO), invoice_ref, customer_name, amount}].
+    SALES vouchers with SO- prefix are excluded.
+    """
+    coll_name = f"BF_{vtype_filter.capitalize()}"
+    xml_body  = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        f"<ID>{coll_name}</ID>"
+        "</HEADER>"
+        "<BODY><DESC>"
+        "<STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"<SVFROMDATE>{from_str}</SVFROMDATE>"
+        f"<SVTODATE>{to_str}</SVTODATE>"
+        "</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        f'<COLLECTION NAME="{coll_name}" ISMODIFY="No">'
+        "<TYPE>Voucher</TYPE>"
+        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
+        "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME</FETCH>"
+        "</COLLECTION>"
+        "</TDLMESSAGE></TDL>"
+        "</DESC></BODY>"
+        "</ENVELOPE>"
+    )
+    r   = requests.post(
+        TALLY_URL, data=xml_body.encode("utf-8"),
+        headers={"Content-Type": "text/xml"}, timeout=60,
+    )
+    xml = r.content.decode("utf-8", errors="replace")
+
+    records = []
+    for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
+        vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+        if not (vtype_m and vtype_filter in vtype_m.group(1).upper()):
+            continue
+        ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
+        ref   = ref_m.group(1).strip() if ref_m else ""
+        if not ref or (vtype_filter == "SALES" and ref.startswith("SO-")):
+            continue
+        amt_m = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        if not amt_m:
+            continue
+        try:
+            amt = round(abs(float(amt_m.group(1))), 2)
+        except ValueError:
+            continue
+        date_m    = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        sale_date = None
+        if date_m:
+            raw = date_m.group(1).strip()
+            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
+                try:
+                    sale_date = datetime.strptime(raw, fmt).date().isoformat()
+                    break
+                except ValueError:
+                    continue
+        if not sale_date:
+            continue
+        party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
+        records.append({
+            "sale_date":     sale_date,
+            "invoice_ref":   ref,
+            "customer_name": html.unescape(party_m.group(1).strip()) if party_m else "",
+            "amount":        amt,
+        })
+    return records
+
+
+def backfill_mode(
+    from_date: date, to_date: date,
+    force: bool, dry_run: bool, by_month: bool = False,
+):
+    """
+    Backfill daily_sales and daily_collections for [from_date, to_date].
     Skips dates that already have a daily_sales row unless force=True.
-    Does NOT re-run Steps 1-8 (outstanding) or Step 10 (sales_history) — those
-    are not date-scoped in the same way.
+
+    by_month=False (default): one Tally request per day — granular skip logic.
+    by_month=True:            two Tally requests per calendar month (SALES + RECEIPT)
+                              then splits by date before upsert — much faster for
+                              large ranges.
+
+    Does NOT re-run Steps 1-8 (outstanding) or Step 10 (sales_history).
     """
     total_days = (to_date - from_date).days + 1
     log.info(
-        "[BACKFILL] Range: %s → %s | %d day(s) | force=%s | dry_run=%s",
-        from_date.isoformat(), to_date.isoformat(), total_days, force, dry_run,
+        "[BACKFILL] Range: %s → %s | %d day(s) | mode=%s | force=%s | dry_run=%s",
+        from_date.isoformat(), to_date.isoformat(), total_days,
+        "by-month" if by_month else "by-day", force, dry_run,
     )
 
-    # Pre-fetch which dates already have daily_sales rows in one query
     supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
     resp = (
         supa.table("daily_sales")
@@ -1447,7 +1533,120 @@ def backfill_mode(from_date: date, to_date: date, force: bool, dry_run: bool):
     existing = {r["sale_date"] for r in (resp.data or [])}
     log.info("[BACKFILL] %d date(s) already have daily_sales data", len(existing))
 
-    synced = 0
+    # ── Monthly mode ──────────────────────────────────────────────────────────
+    if by_month:
+        # Build customer UUID map once for the whole run (not per day)
+        cust_id_map: dict = {}
+        offset = 0
+        while True:
+            batch = (
+                supa.table("customers")
+                .select("id, customer_name")
+                .range(offset, offset + 999)
+                .execute().data
+            ) or []
+            for row in batch:
+                cust_id_map[row["customer_name"].strip().lower()] = row["id"]  # type: ignore[index]
+            if len(batch) < 1000:
+                break
+            offset += 1000
+        log.info("[BACKFILL] Customer UUID map: %d entries", len(cust_id_map))
+
+        def _stamp(items: list) -> list:
+            for item in items:
+                item["customer_id"] = cust_id_map.get(item["customer_name"].strip().lower())
+            return items
+
+        def _group_by_date(records: list) -> dict:
+            out: dict = {}
+            for r in records:
+                out.setdefault(r["sale_date"], []).append(r)
+            return out
+
+        synced  = 0
+        skipped = 0
+        current = date(from_date.year, from_date.month, 1)
+
+        while current <= to_date:
+            next_month  = (
+                date(current.year + 1, 1, 1) if current.month == 12
+                else date(current.year, current.month + 1, 1)
+            )
+            chunk_start = max(current, from_date)
+            chunk_end   = min(next_month - timedelta(days=1), to_date)
+            from_str    = chunk_start.strftime("%Y%m%d")
+            to_str      = chunk_end.strftime("%Y%m%d")
+            log.info("[BACKFILL] Chunk %s – %s", from_str, to_str)
+
+            try:
+                sales_records = _fetch_month_vouchers(from_str, to_str, "SALES")
+                log.info("[BACKFILL]   %d SALES vouchers", len(sales_records))
+            except Exception as exc:
+                log.warning("[BACKFILL]   SALES fetch failed (%s–%s): %s", from_str, to_str, exc)
+                sales_records = []
+
+            try:
+                coll_records = _fetch_month_vouchers(from_str, to_str, "RECEIPT")
+                log.info("[BACKFILL]   %d RECEIPT vouchers", len(coll_records))
+            except Exception as exc:
+                log.warning("[BACKFILL]   RECEIPT fetch failed (%s–%s): %s", from_str, to_str, exc)
+                coll_records = []
+
+            sales_by_date = _group_by_date(sales_records)
+            coll_by_date  = _group_by_date(coll_records)
+            synced_at     = datetime.utcnow().isoformat()
+            all_dates     = sorted(set(sales_by_date) | set(coll_by_date))
+
+            sales_rows: list = []
+            coll_rows:  list = []
+
+            for date_str in all_dates:
+                if date_str in existing and not force:
+                    skipped += 1
+                    continue
+
+                if date_str in sales_by_date:
+                    items = _stamp(sales_by_date[date_str])
+                    sales_rows.append({
+                        "sale_date":     date_str,
+                        "total_amount":  round(sum(i["amount"] for i in items), 2),
+                        "invoice_count": len(items),
+                        "synced_at":     synced_at,
+                        "items":         items,
+                    })
+
+                if date_str in coll_by_date:
+                    items = _stamp(coll_by_date[date_str])
+                    coll_rows.append({
+                        "sale_date":     date_str,
+                        "total_amount":  round(sum(i["amount"] for i in items), 2),
+                        "invoice_count": len(items),
+                        "synced_at":     synced_at,
+                        "items":         items,
+                    })
+
+                synced += 1
+
+            if not dry_run:
+                if sales_rows:
+                    supa.table("daily_sales").upsert(sales_rows, on_conflict="sale_date").execute()
+                if coll_rows:
+                    supa.table("daily_collections").upsert(coll_rows, on_conflict="sale_date").execute()
+
+            log.info(
+                "[BACKFILL]   → %d sales rows, %d collection rows upserted%s",
+                len(sales_rows), len(coll_rows), " (DRY RUN)" if dry_run else "",
+            )
+            current = next_month
+
+        log.info(
+            "[BACKFILL] Finished — %d date(s) upserted, %d skipped (already had data)",
+            synced, skipped,
+        )
+        return
+
+    # ── Per-day mode (default) ────────────────────────────────────────────────
+    synced  = 0
     skipped = 0
     current = from_date
 
@@ -1500,6 +1699,7 @@ def main():
     parser.add_argument("--from",       dest="from_date", metavar="YYYY-MM-DD", help="Backfill start date (inclusive)")
     parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
     parser.add_argument("--force",      action="store_true", help="Overwrite existing rows in --backfill mode")
+    parser.add_argument("--by-month",   action="store_true", help="Backfill one Tally request per month instead of per day (faster)")
     args = parser.parse_args()
 
     dry_run    = args.dry_run
@@ -1526,7 +1726,7 @@ def main():
         log.info("=" * 60)
 
         try:
-            backfill_mode(from_date, to_date, force=args.force, dry_run=dry_run)
+            backfill_mode(from_date, to_date, force=args.force, dry_run=dry_run, by_month=args.by_month)
         except Exception as exc:
             log.exception("BACKFILL FAILED: %s", exc)
             sys.exit(1)
