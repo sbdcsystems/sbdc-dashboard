@@ -828,25 +828,38 @@ def reload_supabase(bills: list, dry_run: bool = False):
 
 def sync_today_sales(dry_run: bool = False):
     """
-    Fetch today's Day Book from Tally, count sales vouchers, and upsert
-    the total + count to daily_sales. Caller should catch exceptions (non-fatal).
+    Fetch today's sales from Tally using the same TDL Collection request as
+    sync_sales_history — returns exactly one record per voucher, no ledger-entry
+    ambiguity. Upserts total + count to daily_sales.
+    Caller should catch exceptions (non-fatal).
     """
     today     = date.today()
     today_str = today.strftime("%Y%m%d")
-    log.info("Step 9 — Fetching today's sales (Day Book)")
+    log.info("Step 9 — Fetching today's sales (TDL Collection)")
 
     xml_body = (
         "<ENVELOPE>"
-        "<HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>"
-        "<BODY><EXPORTDATA><REQUESTDESC>"
-        "<REPORTNAME>Day Book</REPORTNAME>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>TodaySales</ID>"
+        "</HEADER>"
+        "<BODY><DESC>"
         "<STATICVARIABLES>"
         f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
         "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
         f"<SVFROMDATE>{today_str}</SVFROMDATE>"
         f"<SVTODATE>{today_str}</SVTODATE>"
         "</STATICVARIABLES>"
-        "</REQUESTDESC></EXPORTDATA></BODY>"
+        "<TDL><TDLMESSAGE>"
+        '<COLLECTION NAME="TodaySales" ISMODIFY="No">'
+        "<TYPE>Voucher</TYPE>"
+        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
+        "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME</FETCH>"
+        "</COLLECTION>"
+        "</TDLMESSAGE></TDL>"
+        "</DESC></BODY>"
         "</ENVELOPE>"
     )
     r   = requests.post(
@@ -859,29 +872,24 @@ def sync_today_sales(dry_run: bool = False):
     sales_total = 0.0
     sales_count = 0
     items       = []
-    seen_refs   = set()
 
     for v in vouchers:
-        vtype = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
-        if not (vtype and "SALES" in vtype.group(1).upper()):
+        vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+        if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
             continue
 
         ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
         ref   = ref_m.group(1).strip() if ref_m else ""
-        if ref.startswith("SO-"):
-            continue  # skip Sales Order entries
+        if not ref or ref.startswith("SO-"):
+            continue
 
-        amt_m = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        amt_m  = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
         if not amt_m:
             continue
         try:
             amt = round(abs(float(amt_m.group(1))), 2)
         except ValueError:
             continue
-
-        if ref in seen_refs:
-            continue  # dedup: each SBDC- number should only be counted once
-        seen_refs.add(ref)
 
         party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
         sales_total += amt
@@ -900,7 +908,7 @@ def sync_today_sales(dry_run: bool = False):
     log.info(
         "  Per-invoice detail: %s",
         "available" if has_detail
-        else "NOT available — PARTYLEDGERNAME/VOUCHERNUMBER absent from Day Book response",
+        else "NOT available — PARTYLEDGERNAME/VOUCHERNUMBER absent from TDL Collection response",
     )
 
     if dry_run:
