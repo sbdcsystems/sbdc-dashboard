@@ -875,29 +875,21 @@ def sync_today_sales(dry_run: bool = False):
         if not amt_m:
             continue
         try:
-            raw_amt = float(amt_m.group(1))
+            amt = round(abs(float(amt_m.group(1))), 2)
         except ValueError:
             continue
-
-        # Day Book returns one block per ledger entry for each voucher.
-        # The party (customer) entry is a DEBIT → AMOUNT is negative in Tally XML.
-        # Sales account and GST entries are CREDITs → AMOUNT is positive.
-        # Only the party entry carries the GST-inclusive invoice total.
-        if raw_amt <= 0:
-            continue  # skip sales account and GST credit entries
 
         if ref in seen_refs:
             continue  # dedup: each SBDC- number should only be counted once
         seen_refs.add(ref)
 
         party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
-        amt = abs(raw_amt)
         sales_total += amt
         sales_count += 1
         items.append({
             "customer_name": html.unescape(party_m.group(1).strip()) if party_m else "",
             "invoice_ref":   ref,
-            "amount":        round(amt, 2),
+            "amount":        amt,
         })
 
     log.info(
