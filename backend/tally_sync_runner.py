@@ -1020,12 +1020,29 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
     vouchers          = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
     collections_total = 0.0
     receipt_count     = 0
+    skipped_date      = 0
     items             = []
 
     for v in vouchers:
         vtype = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype and "RECEIPT" in vtype.group(1).upper()):
             continue
+
+        # Hard date filter — same fix as Step 9 (Day Book ignores SVFROMDATE/SVTODATE).
+        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        voucher_dt = None
+        if date_m:
+            raw = date_m.group(1).strip()
+            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
+                try:
+                    voucher_dt = datetime.strptime(raw, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        if voucher_dt != today:
+            skipped_date += 1
+            continue
+
         receipt_count += 1
         ref_m   = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
         amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
@@ -1043,6 +1060,8 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
             "amount":        round(amt, 2),
         })
 
+    if skipped_date:
+        log.info("  Skipped %d receipt(s) with date != %s (Day Book returned cross-date records)", skipped_date, today.isoformat())
     log.info(
         "  Today's collections: %d receipt(s), Rs %s",
         receipt_count, f"{collections_total:,.2f}",
