@@ -160,35 +160,41 @@ async function fetchCustHistory(custName, custId) {
       .order('sale_date', { ascending: false })
       .limit(200)
 
-  // Run UUID-stamped rows and null-UUID name rows in parallel.
-  // UUID rows are the reliable anchor; null-UUID rows catch records synced
-  // before UUID stamping was added (April/May history gap).
-  const [uuidResp, nameResp] = await Promise.all([
-    custId ? base().eq('customer_id', custId) : Promise.resolve({ data: [] }),
-    base().is('customer_id', null).ilike('customer_name', custName),
-  ])
-  console.log('[fetchCustHistory] UUID query — rows:', uuidResp.data?.length ?? 0, '| error:', uuidResp.error, '| data:', uuidResp.data)
-  console.log('[fetchCustHistory] Name query (null-UUID) — rows:', nameResp.data?.length ?? 0, '| error:', nameResp.error, '| data:', nameResp.data)
-
-  const combined = _dedupHistory([...(uuidResp.data || []), ...(nameResp.data || [])])
-  console.log('[fetchCustHistory] Combined after dedup — rows:', combined.length, '| data:', combined)
-  if (combined.length > 0) return combined
-
-  // Fuzzy fallback: strip common suffixes and prefix-search null-UUID rows
+  // Strip common business suffixes → broader prefix search
   const stem = custName
-    .replace(/[\s,.]*\b(pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|&\s*co\.?|and\s+co\.?|company|traders?|trading|mills?|industries|enterprises?|exports?|works?|dyers?|textiles?)\s*\.?\s*$/i, '')
+    .replace(/[\s,.]*\b(pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|&\s*co\.?|and\s+co\.?|company|traders?|trading|mills?|industries|enterprises?|exports?|works?|dyers?|textiles?|fabrics?|dyeing|chemicals?|colours?|colors?)\s*\.?\s*$/i, '')
     .trim()
-  console.log('[fetchCustHistory] Fuzzy stem:', stem)
-  if (stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase()) {
-    const { data: fuzzy, error: fuzzyErr } = await base().is('customer_id', null).ilike('customer_name', `${stem}%`)
-    console.log('[fetchCustHistory] Fuzzy query — rows:', fuzzy?.length ?? 0, '| error:', fuzzyErr, '| data:', fuzzy)
-    const withFuzzy = _dedupHistory([...(uuidResp.data || []), ...(fuzzy || [])])
-    console.log('[fetchCustHistory] Combined with fuzzy — rows:', withFuzzy.length, '| data:', withFuzzy)
-    if (withFuzzy.length > 0) return withFuzzy
-  }
 
-  console.log('[fetchCustHistory] FINAL: returning UUID rows only — rows:', uuidResp.data?.length ?? 0)
-  return uuidResp.data || []
+  // Strip honorific/business prefixes from stem → contained-phrase search
+  // e.g. "Sree Laksme Narayan Fabrics" → stem "Sree Laksme Narayan" → core "Laksme Narayan"
+  const core = stem
+    .replace(/^(?:sree|sri|shri|m\s*[\/\.]\s*s\.?|the)\s+/i, '')
+    .trim()
+
+  const stemDiffers = stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase()
+  const coreDiffers = core.length >= 4 && core.toLowerCase() !== stem.toLowerCase() && core.split(/\s+/).length >= 2
+
+  console.log('[fetchCustHistory] stem:', stem, '| core:', core, '| stemDiffers:', stemDiffers, '| coreDiffers:', coreDiffers)
+
+  // Build all searches up front and fire in parallel — no early return that could
+  // skip fallback name searches when UUID rows already exist but are incomplete
+  // (e.g. June has UUID rows, but April/May records have customer_id NULL + name drift).
+  const queries = [
+    custId ? base().eq('customer_id', custId) : Promise.resolve({ data: [] }),  // UUID-stamped rows
+    base().is('customer_id', null).ilike('customer_name', custName),              // exact name, null-UUID
+    ...(stemDiffers ? [base().is('customer_id', null).ilike('customer_name', `${stem}%`)] : []),
+    ...(coreDiffers ? [base().is('customer_id', null).ilike('customer_name', `%${core}%`)] : []),
+  ]
+
+  const results = await Promise.all(queries)
+  console.log('[fetchCustHistory] Query result counts:', results.map((r, i) => {
+    const labels = ['uuid', 'exact', 'stem%', `%${core}%`]
+    return `${labels[i] ?? i}: ${r.data?.length ?? 0}`
+  }))
+
+  const combined = _dedupHistory(results.flatMap(r => r.data || []))
+  console.log('[fetchCustHistory] Combined after dedup — rows:', combined.length, '| data:', combined)
+  return combined
 }
 
 // ── Rating algorithm ─────────────────────────────────────────────────────────
