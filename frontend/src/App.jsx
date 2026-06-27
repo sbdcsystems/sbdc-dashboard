@@ -187,10 +187,11 @@ async function fetchCustHistory(custName, custId) {
   ]
 
   const results = await Promise.all(queries)
-  console.log('[fetchCustHistory] Query result counts:', results.map((r, i) => {
+  const counts = results.map((r, i) => {
     const labels = ['uuid', 'exact', 'stem%', `%${core}%`]
     return `${labels[i] ?? i}: ${r.data?.length ?? 0}`
-  }))
+  })
+  console.log('[fetchCustHistory] Query result counts:', counts.join(', '))
 
   const combined = _dedupHistory(results.flatMap(r => r.data || []))
   console.log('[fetchCustHistory] Combined after dedup — rows:', combined.length, '| data:', combined)
