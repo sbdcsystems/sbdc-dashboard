@@ -876,6 +876,7 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
     sales_count = 0
     items       = []
 
+    skipped_date = 0
     for v in vouchers:
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
@@ -884,6 +885,22 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
         ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
         ref   = ref_m.group(1).strip() if ref_m else ""
         if not ref or ref.startswith("SO-"):
+            continue
+
+        # Hard date filter — Tally's SVFROMDATE/SVTODATE don't always constrain
+        # TDL Collection results; parse DATE and reject anything not matching today.
+        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        voucher_dt = None
+        if date_m:
+            raw = date_m.group(1).strip()
+            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
+                try:
+                    voucher_dt = datetime.strptime(raw, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        if voucher_dt != today:
+            skipped_date += 1
             continue
 
         amt_m  = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
@@ -902,6 +919,9 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
             "invoice_ref":   ref,
             "amount":        amt,
         })
+
+    if skipped_date:
+        log.info("  Skipped %d voucher(s) with date != %s (Tally returned cross-date records)", skipped_date, today.isoformat())
 
     log.info(
         "  Today's sales: %d invoice(s), Rs %s",
