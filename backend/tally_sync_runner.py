@@ -1280,6 +1280,42 @@ def sync_sales_history(dry_run: bool = False):
         upserted += len(batch)
         log.info("  Upserted %d / %d", upserted, len(all_records))
     log.info("  sales_history sync complete")
+
+    # One-time backfill: stamp customer_id on any rows that were written before
+    # UUID stamping was introduced (April/May history gap in the frontend chart).
+    null_by_name: dict = {}
+    null_offset = 0
+    while True:
+        null_batch = (
+            supa.table("sales_history")
+            .select("voucher_number, customer_name")
+            .is_("customer_id", "null")
+            .range(null_offset, null_offset + 999)
+            .execute().data
+        ) or []
+        for r in null_batch:
+            cname = (r.get("customer_name") or "").strip().lower()  # type: ignore[union-attr]
+            null_by_name.setdefault(cname, []).append(r["voucher_number"])  # type: ignore[index]
+        if len(null_batch) < 1000:
+            break
+        null_offset += 1000
+
+    if null_by_name:
+        total_null = sum(len(v) for v in null_by_name.values())
+        log.info("  UUID backfill: %d null-customer_id row(s) across %d name(s)", total_null, len(null_by_name))
+        backfill_updated = 0
+        for cname_lower, vnums in null_by_name.items():
+            cid = cust_id_map.get(cname_lower)
+            if not cid:
+                continue
+            for i in range(0, len(vnums), 200):
+                chunk = vnums[i : i + 200]
+                supa.table("sales_history").update({"customer_id": cid}).in_("voucher_number", chunk).execute()
+                backfill_updated += len(chunk)
+        log.info("  UUID backfill: %d row(s) updated", backfill_updated)
+    else:
+        log.info("  UUID backfill: no null-customer_id rows — already clean")
+
     return today_total
 
 

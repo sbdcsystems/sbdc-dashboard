@@ -143,9 +143,14 @@ function HeroFigure({ amount }) {
 // from customers.customer_name. Try case-insensitive exact match first;
 // if 0 rows, strip common business suffixes and do a prefix LIKE search.
 
-async function fetchCustHistory(custName) {
-  console.log('[DEBUG] fetchCustHistory — querying for:', custName)
+function _dedupHistory(rows) {
+  const seen = new Set()
+  return rows
+    .filter(r => { if (seen.has(r.voucher_number)) return false; seen.add(r.voucher_number); return true })
+    .sort((a, b) => (b.sale_date || '').localeCompare(a.sale_date || ''))
+}
 
+async function fetchCustHistory(custName, custId) {
   const base = () =>
     supabase.from('sales_history')
       .select('sale_date, voucher_number, amount')
@@ -153,22 +158,27 @@ async function fetchCustHistory(custName) {
       .order('sale_date', { ascending: false })
       .limit(200)
 
-  const { data: exact, error: exactErr } = await base().ilike('customer_name', custName)
-  console.log('[DEBUG] ilike exact result — rows:', exact?.length ?? 0, '| error:', exactErr, '| data:', exact)
-  if (exact && exact.length > 0) return exact
+  // Run UUID-stamped rows and null-UUID name rows in parallel.
+  // UUID rows are the reliable anchor; null-UUID rows catch records synced
+  // before UUID stamping was added (April/May history gap).
+  const [uuidResp, nameResp] = await Promise.all([
+    custId ? base().eq('customer_id', custId) : Promise.resolve({ data: [] }),
+    base().is('customer_id', null).ilike('customer_name', custName),
+  ])
+  const combined = _dedupHistory([...(uuidResp.data || []), ...(nameResp.data || [])])
+  if (combined.length > 0) return combined
 
+  // Fuzzy fallback: strip common suffixes and prefix-search null-UUID rows
   const stem = custName
     .replace(/[\s,.]*\b(pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|&\s*co\.?|and\s+co\.?|company|traders?|trading|mills?|industries|enterprises?|exports?|works?|dyers?|textiles?)\s*\.?\s*$/i, '')
     .trim()
-  console.log('[DEBUG] stem after suffix strip:', stem, '| will fuzzy search:', stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase())
   if (stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase()) {
-    const { data: fuzzy, error: fuzzyErr } = await base().ilike('customer_name', `${stem}%`)
-    console.log('[DEBUG] fuzzy result — rows:', fuzzy?.length ?? 0, '| error:', fuzzyErr, '| data:', fuzzy)
-    if (fuzzy && fuzzy.length > 0) return fuzzy
+    const { data: fuzzy } = await base().is('customer_id', null).ilike('customer_name', `${stem}%`)
+    const withFuzzy = _dedupHistory([...(uuidResp.data || []), ...(fuzzy || [])])
+    if (withFuzzy.length > 0) return withFuzzy
   }
 
-  console.log('[DEBUG] fetchCustHistory — no results found for:', custName)
-  return []
+  return uuidResp.data || []
 }
 
 // ── Rating algorithm ─────────────────────────────────────────────────────────
@@ -617,7 +627,7 @@ export default function App() {
         .select('invoice_date, invoice_ref, pending_amount, days_overdue, age_status, bucket')
         .eq('customer_id', customer.id)
         .order('invoice_date', { ascending: true }),
-      fetchCustHistory(customer.customer_name),
+      fetchCustHistory(customer.customer_name, customer.id),
     ])
     setCustDetail({ bills: bills || [], history })
     setCustDetailLoading(false)
