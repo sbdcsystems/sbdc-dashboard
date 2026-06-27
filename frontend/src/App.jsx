@@ -151,6 +151,8 @@ function _dedupHistory(rows) {
 }
 
 async function fetchCustHistory(custName, custId) {
+  console.log('[fetchCustHistory] INPUT — custName:', custName, '| custId:', custId)
+
   const base = () =>
     supabase.from('sales_history')
       .select('sale_date, voucher_number, amount')
@@ -165,19 +167,27 @@ async function fetchCustHistory(custName, custId) {
     custId ? base().eq('customer_id', custId) : Promise.resolve({ data: [] }),
     base().is('customer_id', null).ilike('customer_name', custName),
   ])
+  console.log('[fetchCustHistory] UUID query — rows:', uuidResp.data?.length ?? 0, '| error:', uuidResp.error, '| data:', uuidResp.data)
+  console.log('[fetchCustHistory] Name query (null-UUID) — rows:', nameResp.data?.length ?? 0, '| error:', nameResp.error, '| data:', nameResp.data)
+
   const combined = _dedupHistory([...(uuidResp.data || []), ...(nameResp.data || [])])
+  console.log('[fetchCustHistory] Combined after dedup — rows:', combined.length, '| data:', combined)
   if (combined.length > 0) return combined
 
   // Fuzzy fallback: strip common suffixes and prefix-search null-UUID rows
   const stem = custName
     .replace(/[\s,.]*\b(pvt\.?\s*ltd\.?|private\s+limited|limited|ltd\.?|&\s*co\.?|and\s+co\.?|company|traders?|trading|mills?|industries|enterprises?|exports?|works?|dyers?|textiles?)\s*\.?\s*$/i, '')
     .trim()
+  console.log('[fetchCustHistory] Fuzzy stem:', stem)
   if (stem.length >= 3 && stem.toLowerCase() !== custName.toLowerCase()) {
-    const { data: fuzzy } = await base().is('customer_id', null).ilike('customer_name', `${stem}%`)
+    const { data: fuzzy, error: fuzzyErr } = await base().is('customer_id', null).ilike('customer_name', `${stem}%`)
+    console.log('[fetchCustHistory] Fuzzy query — rows:', fuzzy?.length ?? 0, '| error:', fuzzyErr, '| data:', fuzzy)
     const withFuzzy = _dedupHistory([...(uuidResp.data || []), ...(fuzzy || [])])
+    console.log('[fetchCustHistory] Combined with fuzzy — rows:', withFuzzy.length, '| data:', withFuzzy)
     if (withFuzzy.length > 0) return withFuzzy
   }
 
+  console.log('[fetchCustHistory] FINAL: returning UUID rows only — rows:', uuidResp.data?.length ?? 0)
   return uuidResp.data || []
 }
 
