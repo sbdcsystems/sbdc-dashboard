@@ -865,9 +865,12 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
         "</DESC></BODY>"
         "</ENVELOPE>"
     )
+    # Step 9 TDL request has been observed taking >30s as FY voucher count grows —
+    # if 90s starts timing out too, the request itself needs to be made lighter
+    # (see July 2026 logs).
     r   = requests.post(
         TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=30,
+        headers={"Content-Type": "text/xml"}, timeout=90,
     )
     xml = r.content.decode("utf-8", errors="replace")
 
@@ -1011,9 +1014,12 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
         "</REQUESTDESC></EXPORTDATA></BODY>"
         "</ENVELOPE>"
     )
+    # Step 9 TDL request has been observed taking >30s as FY voucher count grows —
+    # if 90s starts timing out too, the request itself needs to be made lighter
+    # (see July 2026 logs).
     r   = requests.post(
         TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=30,
+        headers={"Content-Type": "text/xml"}, timeout=90,
     )
     xml = r.content.decode("utf-8", errors="replace")
 
