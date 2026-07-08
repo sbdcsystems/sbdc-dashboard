@@ -1368,8 +1368,11 @@ def sync_sales_history(dry_run: bool = False):
 
 def _fetch_tally_voucher_count(date_str: str) -> int:
     """
-    Lightweight second Tally request — fetches only VOUCHERNUMBER+VOUCHERTYPENAME
-    for the date to get an independent count of SALES vouchers (excluding SO-).
+    Lightweight second Tally request — independent count of vouchers matching
+    Step 9's filters exactly: SALES type, real voucher number (not SO-),
+    voucher DATE == date_str, parseable amount. Tally ignores SVFROMDATE/
+    SVTODATE on TDL Collections and returns the whole FY, so the date filter
+    must be applied client-side here, same as Step 9 does.
     """
     xml_body = (
         "<ENVELOPE>"
@@ -1390,7 +1393,7 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
         '<COLLECTION NAME="SalesCountCheck" ISMODIFY="No">'
         "<TYPE>Voucher</TYPE>"
         "<NATIVEMETHOD>Date</NATIVEMETHOD>"
-        "<FETCH>VOUCHERNUMBER, VOUCHERTYPENAME</FETCH>"
+        "<FETCH>DATE, VOUCHERNUMBER, VOUCHERTYPENAME, AMOUNT</FETCH>"
         "</COLLECTION>"
         "</TDLMESSAGE></TDL>"
         "</DESC></BODY>"
@@ -1400,8 +1403,9 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
         TALLY_URL, data=xml_body.encode("utf-8"),
         headers={"Content-Type": "text/xml"}, timeout=30,
     )
-    xml   = r.content.decode("utf-8", errors="replace")
-    count = 0
+    xml    = r.content.decode("utf-8", errors="replace")
+    target = datetime.strptime(date_str, "%Y%m%d").date()
+    count  = 0
     for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
@@ -1409,6 +1413,25 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
         ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
         ref   = ref_m.group(1).strip() if ref_m else ""
         if not ref or ref.startswith("SO-"):
+            continue
+        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        voucher_dt = None
+        if date_m:
+            raw = date_m.group(1).strip()
+            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
+                try:
+                    voucher_dt = datetime.strptime(raw, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        if voucher_dt != target:
+            continue
+        amt_m = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        if not amt_m:
+            continue
+        try:
+            float(amt_m.group(1))
+        except ValueError:
             continue
         count += 1
     return count
