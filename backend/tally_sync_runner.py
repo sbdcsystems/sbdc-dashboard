@@ -878,14 +878,31 @@ _BILL_RE = re.compile(
     r"<BILLDUE>(.*?)</BILLDUE>\s*"
     r"<BILLOVERDUE>(.*?)</BILLOVERDUE>\s*"
     r"<BILLVCHDATE>.*?</BILLVCHDATE>\s*"
-    r"<BILLVCHTYPE>(.*?)</BILLVCHTYPE>",
+    r"<BILLVCHTYPE>(.*?)</BILLVCHTYPE>\s*"
+    r"<BILLVCHNUMBER>.*?</BILLVCHNUMBER>\s*"
+    r"<BILLVCHAMOUNT>(.*?)</BILLVCHAMOUNT>",
     re.DOTALL,
 )
 
-# Voucher types in Bills Receivable that represent credits the customer has already paid
-# (on-account / advance — unmatched to any specific invoice). These should be stored as
-# negative pending_amount so SUM() in the views naturally nets them against outstanding bills.
-_CREDIT_VCH_TYPES = {"Payment", "Receipt"}
+# Fallback ONLY, used when BILLVCHAMOUNT is missing or unparseable — see the
+# sign-based logic in parse_xml(), which is now the primary signal. Confirmed
+# credit-natured types from BILLVCHAMOUNT sign: Receipt (Cash/PoS Receipt
+# share Tally's Receipt-family sign convention, unconfirmed directly but
+# consistent with being receipt-type vouchers) and Credit Note. Deliberately
+# does NOT include "Payment" — investigation on 24-Sep-2026 found that this
+# company's "Payment" bill entries (e.g. "ADV-661" against SS Sun Energy
+# Conservation Company, "Gowtham - TA Expense") have a NEGATIVE
+# BILLVCHAMOUNT, the same sign as a genuine due like GST SALES — the
+# opposite of Receipt's positive sign. "Gowtham" is a real staff member
+# (see People section) and "TA Expense" strongly suggests a staff travel
+# advance ledger, not a customer credit: Tally appears to be recording these
+# as a Debit to the party's ledger (money the party owes back), not a
+# Credit. The previous version of this code had Payment grouped with
+# Receipt as a credit type, which this evidence suggests was wrong — but
+# this is inferred from BILLVCHAMOUNT's sign pattern, not independently
+# confirmed live, so flag any large before/after shift on Payment-type bills
+# for a live sanity check before trusting it fully.
+_CREDIT_VCH_TYPES = {"Receipt", "Cash Receipt", "PoS Receipt", "Credit Note"}
 
 # KNOWN LIMITATION — "Opening Balance On Account" credits are not captured.
 #
@@ -925,8 +942,13 @@ def parse_xml(xml_text: str) -> list:
     cutoff = datetime.now().date() - timedelta(days=RECENT_MONTHS * 30)
     bills  = []
 
-    n_credits = 0
-    for date_raw, ref, party, cl_raw, due_raw, overdue_raw, vch_type in matches:
+    n_credits           = 0
+    n_by_sign           = 0
+    n_by_type_fallback  = 0
+    n_sign_type_disagree = 0
+    disagree_examples   = []
+
+    for date_raw, ref, party, cl_raw, due_raw, overdue_raw, vch_type, vchamt_raw in matches:
         try:
             inv_date = datetime.strptime(date_raw.strip(), "%d-%b-%y").date()
         except ValueError:
@@ -935,14 +957,48 @@ def parse_xml(xml_text: str) -> list:
             due_date = datetime.strptime(due_raw.strip(), "%d-%b-%y").date()
         except ValueError:
             due_date = None
+
+        vch_type_stripped = vch_type.strip()
+        type_says_credit  = vch_type_stripped in _CREDIT_VCH_TYPES
+
+        # Primary signal: BILLVCHAMOUNT's own sign. Tally's internal
+        # convention here is Debit-negative / Credit-positive (confirmed by
+        # GST SALES — an unambiguous due — always being negative, and
+        # Receipt — an unambiguous credit — always being positive). BILLCL
+        # (closing balance) is NOT usable for this: it comes back negative
+        # for every voucher type observed, including plain sales invoices,
+        # so it carries no Dr/Cr information on its own.
         try:
             raw_amt = abs(float(cl_raw.strip()))
-            is_credit = vch_type.strip() in _CREDIT_VCH_TYPES
-            amount = -raw_amt if is_credit else raw_amt
-            if is_credit:
-                n_credits += 1
         except ValueError:
-            amount = 0.0
+            raw_amt = 0.0
+
+        is_credit  = None
+        try:
+            vchamt = float(vchamt_raw.strip())
+            if vchamt != 0:
+                is_credit = vchamt > 0
+                n_by_sign += 1
+                if is_credit != type_says_credit:
+                    n_sign_type_disagree += 1
+                    if len(disagree_examples) < 10:
+                        disagree_examples.append(
+                            f"{party.strip()} / {ref.strip()} / type={vch_type_stripped} "
+                            f"/ sign says {'credit' if is_credit else 'due'}, "
+                            f"type-list says {'credit' if type_says_credit else 'due'}"
+                        )
+        except ValueError:
+            pass
+
+        if is_credit is None:
+            # BILLVCHAMOUNT missing/zero/unparseable — fall back to the type list.
+            is_credit = type_says_credit
+            n_by_type_fallback += 1
+
+        amount = -raw_amt if is_credit else raw_amt
+        if is_credit:
+            n_credits += 1
+
         try:
             overdue = int(float(overdue_raw.strip()))
         except ValueError:
@@ -984,6 +1040,19 @@ def parse_xml(xml_text: str) -> list:
             "  On-account credits: %d entries totalling Rs %s (stored as negative; nets against bills)",
             n_credits, f"{credit_total:,.0f}",
         )
+    log.info(
+        "  Credit/due sign source: %d by BILLVCHAMOUNT sign, %d by voucher-type fallback "
+        "(BILLVCHAMOUNT missing/zero/unparseable)",
+        n_by_sign, n_by_type_fallback,
+    )
+    if n_sign_type_disagree:
+        log.warning(
+            "  %d bill(s) where the amount's sign and the voucher-type list disagree on "
+            "credit-vs-due — sign wins. Sample:",
+            n_sign_type_disagree,
+        )
+        for line in disagree_examples:
+            log.warning("    %s", line)
 
     (BASE_DIR / "parsed_outstanding.json").write_text(
         json.dumps(bills, indent=2, ensure_ascii=False), encoding="utf-8"
