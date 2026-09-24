@@ -104,19 +104,21 @@ Tally must be open and the correct company active before running a live sync.
   voucher-number prefix check regardless).
 - **TDL `<COLLECTION>` DOES support real server-side filtering** — a
   `<FILTER>` referencing a `<SYSTEM TYPE="Formulae">` object filters before
-  Tally sends the response, and it's dramatically cheaper: a single-date
-  filter (`$Date = $$Date:"24-Sep-2026"`) returned 52 vouchers in 8.1s vs
-  ~14,000+ vouchers and ~60s for the same request with no filter. Earlier
-  sessions only tried `SVFROMDATE`/`SVTODATE` report variables against
-  Collections, which don't work — that's a different mechanism from a TDL
-  `<FILTER>` and the two should not be confused. Steps 9, 9b, 10, and the
-  reconcile count check now use `<FILTER>` + `<SYSTEM TYPE="Formulae">`; only
-  the plain single-date-equality form has actually been confirmed against
-  real Tally output — the combined AND formulas (type + not-cancelled) and
-  Step 10's date-RANGE formula are this codebase's extrapolation and are
-  unverified. The code logs a "server response: N raw voucher(s), dates seen
-  X to Y" line for every such request specifically so this can be checked
-  against real logs.
+  Tally sends the response, and it's dramatically cheaper. Confirmed in two
+  rounds: a single-date filter (`$Date = $$Date:"24-Sep-2026"`) returned 52
+  vouchers in 8.1s vs ~14,000+ vouchers and ~60s unfiltered; a date-**range**
+  filter (`$Date >= $$Date:"17-Sep-2026" AND $Date <= $$Date:"23-Sep-2026"`,
+  with `<=` escaped as `&lt;=` in the request XML) returned exactly those
+  578 vouchers in 12.8s. Earlier sessions only tried `SVFROMDATE`/`SVTODATE`
+  report variables against Collections, which don't work — a different
+  mechanism from a TDL `<FILTER>` entirely, and the two should not be
+  confused. Steps 9, 9b, 10, and the reconcile count check now all use
+  `<FILTER>` + `<SYSTEM TYPE="Formulae">`. Both the single-date and
+  date-range forms are now confirmed; the combined AND-with-voucher-type
+  formulas built around them are still this codebase's extrapolation, not
+  separately verified. The code logs a "server response: N raw voucher(s),
+  dates seen X to Y" line for every such request so any future filter
+  regression shows up in real logs.
 - **The "no parseable amount tag" vouchers Step 10 used to warn about are
   cancelled vouchers** — `IsCancelled = Yes`, with empty party, amount, and
   ledger entries. Example: `SBDC-56/26-27`. These are now filtered
@@ -131,16 +133,25 @@ Tally must be open and the correct company active before running a live sync.
   23 (₹7,88,781) because `SBDC-4082/26-27` was entered in Tally in the gap
   between the two steps running. Not a bug — a real live sync will always
   have some chance of this on the current day.
-- **Step 9b legitimately returning 0** is confirmed correct behaviour, not a
-  bug — there were genuinely 0 Receipt vouchers on 24-Sep-2026. This is the
-  scenario the Phase 2 "never write zero on a failed fetch" guard has to
-  tell apart from a broken fetch; a well-formed empty response is not an
-  error.
-- **Receipt voucher type name is unconfirmed** — the reconcile-style exact
-  match `$VoucherTypeName = "Receipt"` used in Step 9b's filter has never
-  matched against a day with actual receipts (there were none on the day
-  this was tested). If Step 9b silently returns 0 every day going forward,
-  check the real `VOUCHERTYPENAME` text on a day with known receipts.
+- **Step 9b legitimately returning 0 on a receipt-free day** is confirmed
+  correct behaviour, not a bug — there were genuinely 0 receipts on
+  24-Sep-2026. This is the scenario the Phase 2 "never write zero on a
+  failed fetch" guard has to tell apart from a broken fetch; a well-formed
+  empty response is not an error.
+- **Collections come in as THREE distinct exact voucher types** —
+  `Receipt`, `PoS Receipt`, and `Cash Receipt` — confirmed live on a
+  follow-up day that actually had receipts. Step 9b's filter now matches all
+  three (`$VoucherTypeName = "Receipt" OR ... = "PoS Receipt" OR ... =
+  "Cash Receipt"`); matching only `"Receipt"` would have silently dropped
+  PoS and cash receipts from `daily_collections` every day. The
+  `RECEIPT_VOUCHER_TYPES` constant is the single source of truth — anything
+  else that ever needs to count collections should use it rather than
+  re-guessing a voucher type list. **Not touched**: `_CREDIT_VCH_TYPES =
+  {"Payment", "Receipt"}` in the Step 3 Bills Receivable parser (a
+  completely different Tally report/field — `BILLVCHTYPE` from Bills
+  Receivable, not `VoucherTypeName` from a Voucher Collection). Whether
+  Bills Receivable's on-account-credit detection also needs the PoS/Cash
+  split is unconfirmed; flagging rather than guessing.
 - **Credit Notes (sales returns) are not included or netted anywhere on the
   dashboard.** Checked both sides: nothing in this repo (frontend or
   backend) references "Credit Note" or "Sales Return" at all, and Step
@@ -304,7 +315,7 @@ Writing to this table is best-effort (wrapped in try/except) — the sync never 
 | 7 | inside reload_supabase | Insert all new outstanding rows |
 | 8 | inside reload_supabase | Delete old rows (previous sync timestamp) |
 | 9 | `sync_today_sales()` | TDL Collection with a server-side date+type+not-cancelled `<FILTER>`, today only, upsert daily_sales |
-| 9b | `sync_today_collections()` | Same TDL Collection + `<FILTER>` approach as Step 9 (`Receipt` type), upsert daily_collections — **no longer uses Day Book** |
+| 9b | `sync_today_collections()` | Same TDL Collection + `<FILTER>` approach as Step 9 (`Receipt`/`PoS Receipt`/`Cash Receipt` types), upsert daily_collections — **no longer uses Day Book** |
 | 10 | `sync_sales_history()` | Current month + one rotating older FY month per run (see below), each with a server-side date-range+type+not-cancelled `<FILTER>`; `--full` does the complete FY sweep |
 
 Steps 9, 9b, and 10 are **non-fatal** — wrapped in try/except so a Tally timeout doesn't abort the outstanding sync, and each is tracked individually in `sync_status`/`last_sync_status.json` so a degraded run shows as `partial`, not silently as `success`.

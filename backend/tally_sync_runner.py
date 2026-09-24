@@ -97,7 +97,9 @@ PAUSE_BETWEEN_REQUESTS = 2.0  # seconds
 # are "GST SALES" and "CC SALES" — "Sales Order" is a separate type and was
 # never included (excluded via the SO- voucher-number prefix check anyway).
 SALES_VOUCHER_TYPES  = ("GST SALES", "CC SALES")
-RECEIPT_VOUCHER_TYPE  = "Receipt"   # unconfirmed against real non-zero data — see _fetch_vouchers_for_day docstring
+# Confirmed live 24-Sep-2026 (a follow-up test, on a day with real receipts):
+# collections come in as three distinct exact voucher types, not one.
+RECEIPT_VOUCHER_TYPES = ("Receipt", "PoS Receipt", "Cash Receipt")
 
 RECENT_MONTHS       = 12    # bills older than this -> age_status "stale"
 XML_KEEP_DAYS       = 7     # delete XML backups older than this
@@ -134,22 +136,25 @@ def _tally_post(xml_body: str, timeout: int, pause_after: float = PAUSE_BETWEEN_
 
 # ── Server-side TDL filtering ────────────────────────────────────────────────────
 #
-# Confirmed live against Tally on 24-Sep-2026: a <COLLECTION> with a <FILTER>
-# referencing a <SYSTEM TYPE="Formulae"> object filters server-side and is
-# dramatically cheaper — 52 vouchers in 8.1s vs ~14,000+ vouchers and ~60s for
-# the same request with no filter. Prior versions of this script fetched the
-# whole Voucher collection every time and filtered entirely in Python because
-# an earlier attempt only tried the (ineffective) SVFROMDATE/SVTODATE report
-# variables, not a real TDL FILTER. Only the simple single-date-equality
-# filter shown in the confirming test has been verified live; the combined
-# AND formulas and the date-range formula built below are this session's
-# extrapolation from that one confirmed case and have NOT been verified
-# against real Tally output. The existing Python-side date/type/cancelled
-# checks are kept as a safety net specifically because of that — if a
-# formula is subtly wrong, correctness still holds, only the performance
-# win might not. Watch the "server response" log lines added throughout this
-# module after deploying to confirm the filters are actually narrowing
-# things down and not silently being ignored.
+# Confirmed live against Tally, two rounds:
+#   24-Sep-2026: a <COLLECTION> with a <FILTER> referencing a
+#     <SYSTEM TYPE="Formulae"> object filters server-side and is dramatically
+#     cheaper — 52 vouchers in 8.1s vs ~14,000+ vouchers and ~60s for the same
+#     request with no filter. Prior versions of this script fetched the whole
+#     Voucher collection every time and filtered entirely in Python because an
+#     earlier attempt only tried the (ineffective) SVFROMDATE/SVTODATE report
+#     variables, not a real TDL FILTER.
+#   Follow-up: the date-RANGE form ($Date >= ... AND $Date <= ...) also works
+#     server-side, with <= escaped as &lt;= per _xml_escape_formula below — a
+#     17–23 Sep range returned exactly those 578 vouchers in 12.8s.
+# So both the single-date-equality and date-range forms are now confirmed.
+# The combined AND-with-voucher-type formulas are still this codebase's
+# extrapolation from those two confirmations, not separately verified. The
+# existing Python-side date/type/cancelled checks are kept as a safety net
+# regardless — if a formula is subtly wrong, correctness still holds, only
+# the performance win might not. The "server response" log lines added
+# throughout this module are what confirmed the above and remain useful for
+# catching any future filter regression.
 
 def _tally_date_literal(d: date) -> str:
     """Tally TDL date-literal format, e.g. 24-Sep-2026 — matches $$Date:"..." usage."""
@@ -1170,14 +1175,11 @@ def _fetch_vouchers_for_day(target_date: date, kind: str, collection_id: str) ->
         type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
         type_substr  = "SALES"
     elif kind == "receipt":
-        # RECEIPT_VOUCHER_TYPE ("Receipt") is an exact-match guess, unconfirmed
-        # against real non-zero data (today had zero receipts to inspect). If
-        # this silently returns 0 every day, check the real VOUCHERTYPENAME
-        # text on a day with actual receipts — the client-side substring
-        # check below won't catch a server-side exact-match miss, since a
-        # wrong exact match returns nothing to even check client-side.
-        type_formula = f'$VoucherTypeName = "{RECEIPT_VOUCHER_TYPE}"'
-        type_substr  = "RECEIPT"
+        # Collections come in as three distinct exact voucher types — confirmed
+        # live 24-Sep-2026 on a day with real receipts. All three must be
+        # matched or e.g. PoS/Cash receipts would silently vanish.
+        type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in RECEIPT_VOUCHER_TYPES)
+        type_substr  = "RECEIPT"  # substring match catches all three: "Receipt"/"PoS Receipt"/"Cash Receipt"
     else:
         raise ValueError(f"unknown kind: {kind}")
 
@@ -1474,10 +1476,9 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
     to_str   = to_date.strftime("%Y%m%d")
     log.info("  Chunk %s – %s", from_str, to_str)
 
-    # Date RANGE filter — unlike Step 9's single-date equality (confirmed live),
-    # this >=/<= range form has NOT been verified against real Tally output.
-    # _log_voucher_date_span below is exactly for catching it if this doesn't
-    # actually narrow the response down to this month.
+    # Date RANGE filter — confirmed live (17-23 Sep returned exactly those
+    # 578 vouchers in 12.8s). _log_voucher_date_span below remains as an
+    # ongoing check that it keeps narrowing the response down to this month.
     type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
     formula = (
         f'$Date >= $$Date:"{_tally_date_literal(from_date)}" AND '
