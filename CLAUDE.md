@@ -97,6 +97,61 @@ npm run dev
 
 Tally must be open and the correct company active before running a live sync.
 
+### Confirmed live facts (24-Sep-2026, office PC)
+
+- **Sales voucher types are `GST SALES` and `CC SALES`** — `Sales Order` is a
+  separate, distinct voucher type (was already excluded via the `SO-`
+  voucher-number prefix check regardless).
+- **TDL `<COLLECTION>` DOES support real server-side filtering** — a
+  `<FILTER>` referencing a `<SYSTEM TYPE="Formulae">` object filters before
+  Tally sends the response, and it's dramatically cheaper: a single-date
+  filter (`$Date = $$Date:"24-Sep-2026"`) returned 52 vouchers in 8.1s vs
+  ~14,000+ vouchers and ~60s for the same request with no filter. Earlier
+  sessions only tried `SVFROMDATE`/`SVTODATE` report variables against
+  Collections, which don't work — that's a different mechanism from a TDL
+  `<FILTER>` and the two should not be confused. Steps 9, 9b, 10, and the
+  reconcile count check now use `<FILTER>` + `<SYSTEM TYPE="Formulae">`; only
+  the plain single-date-equality form has actually been confirmed against
+  real Tally output — the combined AND formulas (type + not-cancelled) and
+  Step 10's date-RANGE formula are this codebase's extrapolation and are
+  unverified. The code logs a "server response: N raw voucher(s), dates seen
+  X to Y" line for every such request specifically so this can be checked
+  against real logs.
+- **The "no parseable amount tag" vouchers Step 10 used to warn about are
+  cancelled vouchers** — `IsCancelled = Yes`, with empty party, amount, and
+  ledger entries. Example: `SBDC-56/26-27`. These are now filtered
+  server-side (`NOT $IsCancelled`) and skipped client-side with a single
+  aggregate INFO count, not a per-voucher warning. A `no parseable amount
+  tag` warning firing today would mean a *new*, still-unexplained case, not
+  this one.
+- **`$Amount` gives the correct invoice total as an absolute value** — no
+  sign convention change needed for how Step 9/9b/10 already use it.
+- **Step 9 vs Step 10 totals can legitimately differ by one invoice** — on
+  24-Sep-2026, Step 9 saw 22 GST SALES vouchers (₹7,76,306) and Step 10 saw
+  23 (₹7,88,781) because `SBDC-4082/26-27` was entered in Tally in the gap
+  between the two steps running. Not a bug — a real live sync will always
+  have some chance of this on the current day.
+- **Step 9b legitimately returning 0** is confirmed correct behaviour, not a
+  bug — there were genuinely 0 Receipt vouchers on 24-Sep-2026. This is the
+  scenario the Phase 2 "never write zero on a failed fetch" guard has to
+  tell apart from a broken fetch; a well-formed empty response is not an
+  error.
+- **Receipt voucher type name is unconfirmed** — the reconcile-style exact
+  match `$VoucherTypeName = "Receipt"` used in Step 9b's filter has never
+  matched against a day with actual receipts (there were none on the day
+  this was tested). If Step 9b silently returns 0 every day going forward,
+  check the real `VOUCHERTYPENAME` text on a day with known receipts.
+- **Credit Notes (sales returns) are not included or netted anywhere on the
+  dashboard.** Checked both sides: nothing in this repo (frontend or
+  backend) references "Credit Note" or "Sales Return" at all, and Step
+  9/9b/10 only ever fetch voucher types matching `GST SALES`/`CC SALES` (now
+  server-side, previously via the "SALES" substring check) — a Credit Note
+  voucher has a different `VoucherTypeName` and was never fetched into
+  `daily_sales` or `sales_history` even before this filter change. The
+  frontend just sums `daily_sales.total_amount` / `sales_history.amount` as
+  stored, with no separate Credit Note netting logic. This was **not**
+  changed as part of this work — flagging as info only, per instruction.
+
 ---
 
 ## Supabase
@@ -248,14 +303,16 @@ Writing to this table is best-effort (wrapped in try/except) — the sync never 
 | 6 | inside reload_supabase | Clear any partial rows from a failed previous run |
 | 7 | inside reload_supabase | Insert all new outstanding rows |
 | 8 | inside reload_supabase | Delete old rows (previous sync timestamp) |
-| 9 | `sync_today_sales()` | TDL Collection, today only, upsert daily_sales |
-| 9b | `sync_today_collections()` | Same TDL Collection approach as Step 9 (RECEIPT vouchers), upsert daily_collections — **no longer uses Day Book** |
-| 10 | `sync_sales_history()` | Current month + one rotating older FY month per run (see below); `--full` does the complete FY sweep |
+| 9 | `sync_today_sales()` | TDL Collection with a server-side date+type+not-cancelled `<FILTER>`, today only, upsert daily_sales |
+| 9b | `sync_today_collections()` | Same TDL Collection + `<FILTER>` approach as Step 9 (`Receipt` type), upsert daily_collections — **no longer uses Day Book** |
+| 10 | `sync_sales_history()` | Current month + one rotating older FY month per run (see below), each with a server-side date-range+type+not-cancelled `<FILTER>`; `--full` does the complete FY sweep |
 
 Steps 9, 9b, and 10 are **non-fatal** — wrapped in try/except so a Tally timeout doesn't abort the outstanding sync, and each is tracked individually in `sync_status`/`last_sync_status.json` so a degraded run shows as `partial`, not silently as `success`.
 Step 4.5 is also non-fatal and **skipped in `--from-local` mode** (can't reach Tally).
 
-**Never treat an exception from Steps 9/9b as "zero"**: `_fetch_vouchers_for_day()` raises if Tally's response is implausibly small rather than returning an empty result — a broken fetch must never overwrite `daily_sales`/`daily_collections` with 0. The existing per-step try/except means nothing gets upserted at all when that happens; the previous value is left untouched.
+**Never treat an exception from Steps 9/9b as "zero"**: `_fetch_vouchers_for_day()` raises if Tally's response is implausibly small, or if Tally reports a TDL error (`_raise_on_tally_error` — a `<LINEERROR>` in the response, e.g. a bad filter formula), rather than silently returning an empty result — a broken fetch must never overwrite `daily_sales`/`daily_collections` with 0. The existing per-step try/except means nothing gets upserted at all when that happens; the previous value is left untouched. See "Confirmed live facts" above for what's actually been verified about the filters themselves vs. what's this codebase's untested extrapolation.
+
+**Cancelled vouchers**: `IsCancelled=Yes` vouchers are excluded server-side (`NOT $IsCancelled` in the filter) and, as a safety net, also skipped client-side — Steps 9/9b/10 all check `_is_voucher_cancelled()` and log one aggregate INFO count, not a warning per voucher. This is what the old per-voucher "no parseable amount tag" warnings in Step 10 turned out to be.
 
 **Incremental sales_history (Step 10)**: re-fetching the whole FY every run was overloading the (weak) billing PC — the April chunk alone was 14,161 raw voucher tags and took 60s, and by the time the loop reached June the connection was being reset, then refused outright. A scheduled run now only fetches the current month plus one older FY month chosen in rotation (pointer kept in `backend/sync_state.json`), plus the previous month for the first `NEW_MONTH_CATCHUP_RUNS` (6) runs after a month rolls over. With ~18 runs/day the full FY still gets covered, just spread out instead of repeated every single run. `--full` forces a complete sweep. Upserts are keyed on `voucher_number` and this step never deletes, so an incremental run can't lose data — it can only be behind on months it hasn't rotated to yet.
 

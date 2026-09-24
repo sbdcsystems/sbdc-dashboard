@@ -32,7 +32,7 @@ import logging
 import smtplib
 import sys
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, UTC
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -47,7 +47,7 @@ LOG_DIR  = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 RUN_TS         = datetime.now().strftime("%Y%m%d_%H%M%S")
-SYNC_TIMESTAMP = datetime.utcnow().isoformat()   # stored in synced_from_tally_at column
+SYNC_TIMESTAMP = datetime.now(UTC).isoformat()   # stored in synced_from_tally_at column
 log_path       = LOG_DIR / f"sync_{RUN_TS}.log"
 
 # Reconfigure stdout/stderr to real UTF-8 before logging is set up. Task
@@ -93,6 +93,12 @@ TALLY_COLLECTION_TIMEOUT  = 90   # Step 9 / 9b / 10-chunk / reconcile — TDL <C
 # doesn't monopolise Tally while staff are billing on the same PC.
 PAUSE_BETWEEN_REQUESTS = 2.0  # seconds
 
+# Confirmed live against Tally on 24-Sep-2026 (office PC). Sales voucher types
+# are "GST SALES" and "CC SALES" — "Sales Order" is a separate type and was
+# never included (excluded via the SO- voucher-number prefix check anyway).
+SALES_VOUCHER_TYPES  = ("GST SALES", "CC SALES")
+RECEIPT_VOUCHER_TYPE  = "Receipt"   # unconfirmed against real non-zero data — see _fetch_vouchers_for_day docstring
+
 RECENT_MONTHS       = 12    # bills older than this -> age_status "stale"
 XML_KEEP_DAYS       = 7     # delete XML backups older than this
 SUPABASE_BATCH      = 200   # records per insert call
@@ -124,6 +130,103 @@ def _tally_post(xml_body: str, timeout: int, pause_after: float = PAUSE_BETWEEN_
     finally:
         if pause_after:
             time.sleep(pause_after)
+
+
+# ── Server-side TDL filtering ────────────────────────────────────────────────────
+#
+# Confirmed live against Tally on 24-Sep-2026: a <COLLECTION> with a <FILTER>
+# referencing a <SYSTEM TYPE="Formulae"> object filters server-side and is
+# dramatically cheaper — 52 vouchers in 8.1s vs ~14,000+ vouchers and ~60s for
+# the same request with no filter. Prior versions of this script fetched the
+# whole Voucher collection every time and filtered entirely in Python because
+# an earlier attempt only tried the (ineffective) SVFROMDATE/SVTODATE report
+# variables, not a real TDL FILTER. Only the simple single-date-equality
+# filter shown in the confirming test has been verified live; the combined
+# AND formulas and the date-range formula built below are this session's
+# extrapolation from that one confirmed case and have NOT been verified
+# against real Tally output. The existing Python-side date/type/cancelled
+# checks are kept as a safety net specifically because of that — if a
+# formula is subtly wrong, correctness still holds, only the performance
+# win might not. Watch the "server response" log lines added throughout this
+# module after deploying to confirm the filters are actually narrowing
+# things down and not silently being ignored.
+
+def _tally_date_literal(d: date) -> str:
+    """Tally TDL date-literal format, e.g. 24-Sep-2026 — matches $$Date:"..." usage."""
+    return d.strftime("%d-%b-%Y")
+
+
+def _xml_escape_formula(formula: str) -> str:
+    """
+    Escape a TDL formula for embedding as XML element text. Only <, >, and &
+    need it — the confirmed-working live example embedded raw double quotes
+    unescaped inside the <SYSTEM> element, so quotes are left as-is to match
+    that exactly rather than guessing an escaping style Tally wasn't shown to
+    accept.
+    """
+    return formula.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _build_voucher_collection_request(collection_id: str, fetch_fields: str, filter_formula: str) -> str:
+    """Build a TDL Collection request with a server-side FILTER formula."""
+    filter_name = f"{collection_id}Filter"
+    return (
+        "<ENVELOPE>"
+        "<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
+        f"<TYPE>Collection</TYPE><ID>{collection_id}</ID></HEADER>"
+        "<BODY><DESC>"
+        "<STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        "</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        f'<COLLECTION NAME="{collection_id}" ISMODIFY="No">'
+        "<TYPE>Voucher</TYPE>"
+        f"<FETCH>{fetch_fields}</FETCH>"
+        f"<FILTER>{filter_name}</FILTER>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="{filter_name}">{_xml_escape_formula(filter_formula)}</SYSTEM>'
+        "</TDLMESSAGE></TDL>"
+        "</DESC></BODY>"
+        "</ENVELOPE>"
+    )
+
+
+def _raise_on_tally_error(xml: str, context: str):
+    """Tally reports a bad TDL request (e.g. a formula syntax error) as a <LINEERROR> in an otherwise well-formed response — that would otherwise look like a silent, legitimate zero."""
+    err_m = re.search(r"<LINEERROR>(.*?)</LINEERROR>", xml, re.DOTALL)
+    if err_m:
+        raise RuntimeError(f"Tally reported a TDL error for {context}: {html.unescape(err_m.group(1).strip())}")
+
+
+def _parse_tally_date(raw: str) -> "date | None":
+    raw = raw.strip()
+    for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_voucher_cancelled(voucher_xml: str) -> bool:
+    m = re.search(r"<ISCANCELLED[^>]*>(.*?)</ISCANCELLED>", voucher_xml, re.IGNORECASE)
+    return bool(m and m.group(1).strip().lower() == "yes")
+
+
+def _log_voucher_date_span(context: str, raw_count: int, dates_seen: list):
+    """
+    Diagnostic for verifying the new server-side date filters actually work —
+    if a request scoped to one month comes back with dates spanning the whole
+    FY, the filter silently didn't apply and Tally returned everything.
+    """
+    if dates_seen:
+        log.info(
+            "  %s server response: %d raw voucher(s), dates seen %s to %s",
+            context, raw_count, min(dates_seen).isoformat(), max(dates_seen).isoformat(),
+        )
+    else:
+        log.info("  %s server response: %d raw voucher(s), no parseable dates", context, raw_count)
 
 
 # ── Local run-state (sales_history rotation) ────────────────────────────────────
@@ -1041,17 +1144,18 @@ def reload_supabase(bills: list, dry_run: bool = False):
 # ── Shared: one day of vouchers via TDL Collection ────────────────────────────
 #
 # Step 9 (sales) and Step 9b (collections) fetch the same shape of data for a
-# single day and differ only in which VOUCHERTYPENAME they keep. Step 9b used
-# to use a Day Book EXPORTDATA report instead, which returns one row per
-# ledger entry rather than per voucher — ambiguous for multi-ledger receipts.
-# Both now go through TDL Collection, matching Step 9's approach, with the
-# same client-side hard date filter (Tally's SVFROMDATE/SVTODATE don't
-# reliably constrain TDL Collection results).
+# single day and differ only in which voucher type they keep. Step 9b used to
+# use a Day Book EXPORTDATA report instead, which returns one row per ledger
+# entry rather than per voucher — ambiguous for multi-ledger receipts. Both
+# now go through TDL Collection with a server-side date+type+not-cancelled
+# FILTER (see "Server-side TDL filtering" above), plus the same client-side
+# checks as a safety net in case a formula doesn't do exactly what it looks
+# like it should.
 
-def _fetch_vouchers_for_day(target_date: date, voucher_type_substr: str, collection_id: str) -> list:
+def _fetch_vouchers_for_day(target_date: date, kind: str, collection_id: str) -> list:
     """
-    Fetch one day's vouchers of a given type from Tally. Returns a list of
-    {customer_name, invoice_ref, amount} dicts.
+    Fetch one day's vouchers of a given kind ("sales" or "receipt") from
+    Tally. Returns a list of {customer_name, invoice_ref, amount} dicts.
 
     Raises RuntimeError if the response is implausibly small (e.g. Tally
     dropped the connection mid-response, or answered with an error page)
@@ -1060,33 +1164,27 @@ def _fetch_vouchers_for_day(target_date: date, voucher_type_substr: str, collect
     request, but a *broken* one is smaller still (no ENVELOPE/BODY wrapper).
     This is what stops a failed fetch from ever being recorded as an honest
     zero: the caller never even gets a result to upsert, it gets an exception.
+    Also raises if Tally reports a TDL error on the request (_raise_on_tally_error).
     """
-    day_str  = target_date.strftime("%Y%m%d")
-    xml_body = (
-        "<ENVELOPE>"
-        "<HEADER>"
-        "<VERSION>1</VERSION>"
-        "<TALLYREQUEST>Export</TALLYREQUEST>"
-        "<TYPE>Collection</TYPE>"
-        f"<ID>{collection_id}</ID>"
-        "</HEADER>"
-        "<BODY><DESC>"
-        "<STATICVARIABLES>"
-        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
-        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
-        f"<SVFROMDATE>{day_str}</SVFROMDATE>"
-        f"<SVTODATE>{day_str}</SVTODATE>"
-        "</STATICVARIABLES>"
-        "<TDL><TDLMESSAGE>"
-        f'<COLLECTION NAME="{collection_id}" ISMODIFY="No">'
-        "<TYPE>Voucher</TYPE>"
-        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
-        "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME</FETCH>"
-        "</COLLECTION>"
-        "</TDLMESSAGE></TDL>"
-        "</DESC></BODY>"
-        "</ENVELOPE>"
-    )
+    if kind == "sales":
+        type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
+        type_substr  = "SALES"
+    elif kind == "receipt":
+        # RECEIPT_VOUCHER_TYPE ("Receipt") is an exact-match guess, unconfirmed
+        # against real non-zero data (today had zero receipts to inspect). If
+        # this silently returns 0 every day, check the real VOUCHERTYPENAME
+        # text on a day with actual receipts — the client-side substring
+        # check below won't catch a server-side exact-match miss, since a
+        # wrong exact match returns nothing to even check client-side.
+        type_formula = f'$VoucherTypeName = "{RECEIPT_VOUCHER_TYPE}"'
+        type_substr  = "RECEIPT"
+    else:
+        raise ValueError(f"unknown kind: {kind}")
+
+    formula = f'$Date = $$Date:"{_tally_date_literal(target_date)}" AND NOT $IsCancelled AND ({type_formula})'
+    fetch_fields = "Date, VoucherNumber, PartyLedgerName, Amount, VoucherTypeName, IsCancelled"
+    xml_body = _build_voucher_collection_request(collection_id, fetch_fields, formula)
+
     raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
     if len(raw) < 200:
         raise RuntimeError(
@@ -1094,31 +1192,35 @@ def _fetch_vouchers_for_day(target_date: date, voucher_type_substr: str, collect
             "— treating this as a failed fetch, not a real zero"
         )
     xml = raw.decode("utf-8", errors="replace")
+    _raise_on_tally_error(xml, collection_id)
 
-    items        = []
-    skipped_date = 0
-    for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
+    vouchers          = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
+    items             = []
+    skipped_date      = 0
+    skipped_cancelled = 0
+    dates_seen        = []
+
+    for v in vouchers:
+        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        voucher_dt = _parse_tally_date(date_m.group(1)) if date_m else None
+        if voucher_dt:
+            dates_seen.append(voucher_dt)
+
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
-        if not (vtype_m and voucher_type_substr in vtype_m.group(1).upper()):
+        if not (vtype_m and type_substr in vtype_m.group(1).upper()):
             continue
 
         ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
         ref   = ref_m.group(1).strip() if ref_m else ""
         # Sales Orders (SO-) aren't real sales — same exclusion Step 9 always had.
         # Receipts have no equivalent prefix to exclude.
-        if voucher_type_substr == "SALES" and (not ref or ref.startswith("SO-")):
+        if kind == "sales" and (not ref or ref.startswith("SO-")):
             continue
 
-        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
-        voucher_dt = None
-        if date_m:
-            raw_date = date_m.group(1).strip()
-            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
-                try:
-                    voucher_dt = datetime.strptime(raw_date, fmt).date()
-                    break
-                except ValueError:
-                    continue
+        if _is_voucher_cancelled(v):
+            skipped_cancelled += 1
+            continue
+
         if voucher_dt != target_date:
             skipped_date += 1
             continue
@@ -1138,9 +1240,12 @@ def _fetch_vouchers_for_day(target_date: date, voucher_type_substr: str, collect
             "amount":        amt,
         })
 
+    _log_voucher_date_span(collection_id, len(vouchers), dates_seen)
+    if skipped_cancelled:
+        log.info("  Skipped %d cancelled voucher(s)", skipped_cancelled)
     if skipped_date:
         log.info(
-            "  Skipped %d voucher(s) with date != %s (Tally returned cross-date records)",
+            "  Skipped %d voucher(s) with date != %s (server-side date filter didn't fully narrow it down)",
             skipped_date, target_date.isoformat(),
         )
     return items
@@ -1186,7 +1291,7 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
     today = target_date or date.today()
     log.info("Step 9 — Fetching sales for %s (TDL Collection)", today.isoformat())
 
-    items       = _fetch_vouchers_for_day(today, "SALES", "TodaySales")
+    items       = _fetch_vouchers_for_day(today, "sales", "TodaySales")
     sales_count = len(items)
     sales_total = round(sum(i["amount"] for i in items), 2)
 
@@ -1215,7 +1320,7 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
             "sale_date":     today.isoformat(),
             "total_amount":  sales_total,
             "invoice_count": sales_count,
-            "synced_at":     datetime.utcnow().isoformat(),
+            "synced_at":     datetime.now(UTC).isoformat(),
             "items":         items,
         },
         on_conflict="sale_date",
@@ -1237,7 +1342,7 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
     today = target_date or date.today()
     log.info("Step 9b — Fetching collections for %s (TDL Collection)", today.isoformat())
 
-    items         = _fetch_vouchers_for_day(today, "RECEIPT", "TodayCollections")
+    items         = _fetch_vouchers_for_day(today, "receipt", "TodayCollections")
     receipt_count = len(items)
     collections_total = round(sum(i["amount"] for i in items), 2)
 
@@ -1257,7 +1362,7 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
             "sale_date":     today.isoformat(),
             "total_amount":  collections_total,
             "invoice_count": receipt_count,
-            "synced_at":     datetime.utcnow().isoformat(),
+            "synced_at":     datetime.now(UTC).isoformat(),
             "items":         items,
         },
         on_conflict="sale_date",
@@ -1355,38 +1460,36 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
     record dicts (possibly empty). Never raises for a single bad chunk — a
     timeout or connection failure on one month must not abort the months
     still queued behind it, so this logs a warning and returns [] instead.
+
+    Confirmed live 24-Sep-2026: "no parseable amount tag" skips were all
+    cancelled vouchers (IsCancelled=Yes, with empty party/amount/entries) —
+    e.g. SBDC-56/26-27. Those are now filtered server-side (NOT $IsCancelled)
+    and skipped client-side with a single aggregate count, not a per-voucher
+    warning. The remaining "no parseable amount tag" path below should now
+    only fire for a genuinely unexplained case — it still gets captured to
+    debug_skipped_vouchers.xml since that would be new information.
     """
     from_date, to_date = _month_bounds(year, month, today)
     from_str = from_date.strftime("%Y%m%d")
     to_str   = to_date.strftime("%Y%m%d")
     log.info("  Chunk %s – %s", from_str, to_str)
 
-    xml_body = (
-        "<ENVELOPE>"
-        "<HEADER>"
-        "<VERSION>1</VERSION>"
-        "<TALLYREQUEST>Export</TALLYREQUEST>"
-        "<TYPE>Collection</TYPE>"
-        "<ID>SalesHistory</ID>"
-        "</HEADER>"
-        "<BODY><DESC>"
-        "<STATICVARIABLES>"
-        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
-        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
-        f"<SVFROMDATE>{from_str}</SVFROMDATE>"
-        f"<SVTODATE>{to_str}</SVTODATE>"
-        "</STATICVARIABLES>"
-        "<TDL><TDLMESSAGE>"
-        '<COLLECTION NAME="SalesHistory" ISMODIFY="No">'
-        "<TYPE>Voucher</TYPE>"
-        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
-        "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME,"
-        " STOCKITEMNAME, ACTUALQTY, RATE</FETCH>"
-        "</COLLECTION>"
-        "</TDLMESSAGE></TDL>"
-        "</DESC></BODY>"
-        "</ENVELOPE>"
+    # Date RANGE filter — unlike Step 9's single-date equality (confirmed live),
+    # this >=/<= range form has NOT been verified against real Tally output.
+    # _log_voucher_date_span below is exactly for catching it if this doesn't
+    # actually narrow the response down to this month.
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
+    formula = (
+        f'$Date >= $$Date:"{_tally_date_literal(from_date)}" AND '
+        f'$Date <= $$Date:"{_tally_date_literal(to_date)}" AND '
+        f'NOT $IsCancelled AND ({type_formula})'
     )
+    xml_body = _build_voucher_collection_request(
+        "SalesHistory",
+        "Date, VoucherNumber, PartyLedgerName, Amount, VoucherTypeName, IsCancelled, StockItemName, ActualQty, Rate",
+        formula,
+    )
+
     try:
         raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
     except requests.exceptions.RequestException as exc:
@@ -1397,14 +1500,23 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
         return []
 
     xml = raw.decode("utf-8", errors="replace")
-    records     = []
-    vouchers    = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
-    raw_count   = len(vouchers)
-    after_sales = 0
-    after_so    = 0
-    synced_at   = datetime.utcnow().isoformat()
+    _raise_on_tally_error(xml, f"SalesHistory chunk {from_str}-{to_str}")
+
+    records           = []
+    vouchers          = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
+    raw_count         = len(vouchers)
+    after_sales       = 0
+    after_so          = 0
+    skipped_cancelled = 0
+    dates_seen        = []
+    synced_at         = datetime.now(UTC).isoformat()
 
     for v in vouchers:
+        date_m  = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        v_date  = _parse_tally_date(date_m.group(1)) if date_m else None
+        if v_date:
+            dates_seen.append(v_date)
+
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
             continue
@@ -1415,29 +1527,24 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
             continue
         after_so += 1
 
-        date_m  = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        if _is_voucher_cancelled(v):
+            skipped_cancelled += 1
+            continue
+
         party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
         amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
         stock_m = re.search(r"<STOCKITEMNAME[^>]*>(.*?)</STOCKITEMNAME>", v)
         qty_m   = re.search(r"<ACTUALQTY[^>]*>(.*?)</ACTUALQTY>", v)
         rate_m  = re.search(r"<RATE[^>]*>(.*?)</RATE>", v)
 
-        sale_date = None
-        if date_m:
-            raw_date_str = date_m.group(1).strip()
-            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
-                try:
-                    sale_date = datetime.strptime(raw_date_str, fmt).date().isoformat()
-                    break
-                except ValueError:
-                    continue
+        sale_date = v_date.isoformat() if v_date else None
 
         amount = None
         if amt_m:
             try:    amount = round(abs(float(amt_m.group(1))), 2)
             except: pass  # noqa: E722
         if amount is None:
-            log.warning("  Skipping %s — no parseable amount tag", ref)
+            log.warning("  Skipping %s — no parseable amount tag (not a known-cancelled voucher)", ref)
             _note_skip_example(skip_examples, ref, v)
             continue
 
@@ -1453,6 +1560,9 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
             "synced_at":      synced_at,
         })
 
+    _log_voucher_date_span(f"SalesHistory chunk {from_str}-{to_str}", raw_count, dates_seen)
+    if skipped_cancelled:
+        log.info("  Skipped %d cancelled voucher(s)", skipped_cancelled)
     log.info(
         "  Chunk: %d raw VOUCHER tags | %d after SALES filter | %d after SO- filter | %d added",
         raw_count, after_sales, after_so, len(records),
@@ -1640,41 +1750,33 @@ def sync_sales_history(dry_run: bool = False, full: bool = False):
 def _fetch_tally_voucher_count(date_str: str) -> int:
     """
     Lightweight second Tally request — independent count of vouchers matching
-    Step 9's filters exactly: SALES type, real voucher number (not SO-),
-    voucher DATE == date_str, parseable amount. Tally ignores SVFROMDATE/
-    SVTODATE on TDL Collections and returns the whole FY, so the date filter
-    must be applied client-side here, same as Step 9 does.
+    Step 9's filters: sales voucher type, real voucher number (not SO-),
+    voucher DATE == date_str, not cancelled, parseable amount. Uses the same
+    server-side date+type+not-cancelled FILTER as Step 9, with the same
+    client-side checks kept as a safety net (see "Server-side TDL filtering").
     """
-    xml_body = (
-        "<ENVELOPE>"
-        "<HEADER>"
-        "<VERSION>1</VERSION>"
-        "<TALLYREQUEST>Export</TALLYREQUEST>"
-        "<TYPE>Collection</TYPE>"
-        "<ID>SalesCountCheck</ID>"
-        "</HEADER>"
-        "<BODY><DESC>"
-        "<STATICVARIABLES>"
-        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
-        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
-        f"<SVFROMDATE>{date_str}</SVFROMDATE>"
-        f"<SVTODATE>{date_str}</SVTODATE>"
-        "</STATICVARIABLES>"
-        "<TDL><TDLMESSAGE>"
-        '<COLLECTION NAME="SalesCountCheck" ISMODIFY="No">'
-        "<TYPE>Voucher</TYPE>"
-        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
-        "<FETCH>DATE, VOUCHERNUMBER, VOUCHERTYPENAME, AMOUNT</FETCH>"
-        "</COLLECTION>"
-        "</TDLMESSAGE></TDL>"
-        "</DESC></BODY>"
-        "</ENVELOPE>"
-    )
-    raw    = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
-    xml    = raw.decode("utf-8", errors="replace")
     target = datetime.strptime(date_str, "%Y%m%d").date()
-    count  = 0
-    for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
+    formula = f'$Date = $$Date:"{_tally_date_literal(target)}" AND NOT $IsCancelled AND ({type_formula})'
+    xml_body = _build_voucher_collection_request(
+        "SalesCountCheck",
+        "Date, VoucherNumber, VoucherTypeName, Amount, IsCancelled",
+        formula,
+    )
+
+    raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
+    _raise_on_tally_error(xml, "SalesCountCheck")
+
+    vouchers   = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
+    count      = 0
+    dates_seen = []
+    for v in vouchers:
+        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        voucher_dt = _parse_tally_date(date_m.group(1)) if date_m else None
+        if voucher_dt:
+            dates_seen.append(voucher_dt)
+
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
             continue
@@ -1682,16 +1784,8 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
         ref   = ref_m.group(1).strip() if ref_m else ""
         if not ref or ref.startswith("SO-"):
             continue
-        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
-        voucher_dt = None
-        if date_m:
-            raw = date_m.group(1).strip()
-            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
-                try:
-                    voucher_dt = datetime.strptime(raw, fmt).date()
-                    break
-                except ValueError:
-                    continue
+        if _is_voucher_cancelled(v):
+            continue
         if voucher_dt != target:
             continue
         amt_m = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
@@ -1702,6 +1796,8 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
         except ValueError:
             continue
         count += 1
+
+    _log_voucher_date_span("SalesCountCheck", len(vouchers), dates_seen)
     return count
 
 
