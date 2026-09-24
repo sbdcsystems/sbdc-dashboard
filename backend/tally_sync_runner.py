@@ -31,6 +31,7 @@ import html
 import logging
 import smtplib
 import sys
+import time
 from datetime import datetime, timedelta, date
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -49,12 +50,24 @@ RUN_TS         = datetime.now().strftime("%Y%m%d_%H%M%S")
 SYNC_TIMESTAMP = datetime.utcnow().isoformat()   # stored in synced_from_tally_at column
 log_path       = LOG_DIR / f"sync_{RUN_TS}.log"
 
+# Reconfigure stdout/stderr to real UTF-8 before logging is set up. Task
+# Scheduler runs this with stdout redirected to a file using the OS default
+# codepage (not UTF-8 on this Windows box), which silently mangles the em
+# dashes (—) used throughout these log messages into garbage bytes. The log
+# FILE handler below already forces UTF-8; this makes the console/redirected
+# stream match it.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass  # non-interactive stream or a Python old enough to lack reconfigure()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(log_path, encoding="utf-8"),
+        logging.FileHandler(log_path, encoding="utf-8", errors="replace"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -68,12 +81,147 @@ TALLY_IP      = os.environ.get("TALLY_SERVER_IP", "192.168.0.205")
 TALLY_PORT    = int(os.environ.get("TALLY_PORT", "9000"))
 TALLY_URL     = f"http://{TALLY_IP}:{TALLY_PORT}"
 TALLY_COMPANY = os.environ.get("TALLY_COMPANY_NAME", "SUPREME BALAJI DYE CHEM - 25-26")
-TALLY_TIMEOUT = 60
+
+# Timeouts, sized to what each request actually asks Tally to do. The billing
+# PC is not powerful and must stay responsive for staff during office hours.
+TALLY_CHECK_TIMEOUT      = 5    # Step 1 — just a reachability ping
+TALLY_TIMEOUT             = 60   # Step 2 — Bills Receivable, full FY, EXPLODEFLAG
+TALLY_LEDGER_TIMEOUT      = 90   # Step 4.5/4.6 — full ledger master, no date scope
+TALLY_COLLECTION_TIMEOUT  = 90   # Step 9 / 9b / 10-chunk / reconcile — TDL <COLLECTION> voucher fetches
+
+# Pause after every Tally request so a run of several requests in a row
+# doesn't monopolise Tally while staff are billing on the same PC.
+PAUSE_BETWEEN_REQUESTS = 2.0  # seconds
 
 RECENT_MONTHS       = 12    # bills older than this -> age_status "stale"
 XML_KEEP_DAYS       = 7     # delete XML backups older than this
 SUPABASE_BATCH      = 200   # records per insert call
 SANITY_DROP_LIMIT   = 0.50  # abort if new bill count < 50% of current DB count
+
+# ── Phase 1 incremental sales_history state ────────────────────────────────────
+STATE_FILE            = BASE_DIR / "sync_state.json"
+NEW_MONTH_CATCHUP_RUNS = 6   # re-fetch previous month for this many runs after a month rolls over
+
+# ── Phase 2 overlap lock ────────────────────────────────────────────────────────
+LOCK_FILE           = BASE_DIR / "sync.lock"
+LOCK_STALE_MINUTES  = 20   # office PC can be switched off mid-run; don't let a dead lock block forever
+
+# ── Shared Tally request helper ─────────────────────────────────────────────────
+
+def _tally_post(xml_body: str, timeout: int, pause_after: float = PAUSE_BETWEEN_REQUESTS) -> bytes:
+    """
+    POST one TDL/export request to Tally and pause briefly afterward so a run
+    making several requests in a row doesn't monopolise the billing PC.
+    Returns the raw response bytes. Raises on a request-level failure
+    (timeout, connection error) — callers decide whether that's fatal.
+    """
+    try:
+        r = requests.post(
+            TALLY_URL, data=xml_body.encode("utf-8"),
+            headers={"Content-Type": "text/xml"}, timeout=timeout,
+        )
+        return r.content
+    finally:
+        if pause_after:
+            time.sleep(pause_after)
+
+
+# ── Local run-state (sales_history rotation) ────────────────────────────────────
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("  Could not parse %s (%s) — starting with fresh state", STATE_FILE.name, exc)
+    return {}
+
+
+def _save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+# ── Overlap lock ─────────────────────────────────────────────────────────────────
+
+def _pid_running(pid: int) -> bool:
+    """Best-effort check for whether a PID is still alive, on Windows or POSIX."""
+    if not pid:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def acquire_lock() -> bool:
+    """
+    Refuse to start a second run while one is already in progress. A lock is
+    treated as stale (safe to remove) if its PID is no longer running OR it
+    is older than LOCK_STALE_MINUTES — the office PC is switched off at 7 PM
+    and can be shut down mid-run, which would otherwise leave a lock nothing
+    can ever clear.
+    """
+    if LOCK_FILE.exists():
+        lock_pid, lock_started = None, None
+        try:
+            info         = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+            lock_pid     = info.get("pid")
+            lock_started = datetime.fromisoformat(info.get("started_at"))
+        except Exception as exc:
+            log.warning("  Lock file unreadable (%s) — treating as stale", exc)
+
+        age_minutes = (
+            (datetime.now() - lock_started).total_seconds() / 60
+            if lock_started is not None else None
+        )
+        pid_alive = lock_pid is not None and _pid_running(lock_pid)
+        stale = (
+            lock_started is None
+            or not pid_alive
+            or age_minutes > LOCK_STALE_MINUTES
+        )
+
+        if not stale:
+            log.warning(
+                "  Another sync is already running (PID %s, started %s, %.0f min ago) — exiting cleanly",
+                lock_pid, lock_started.isoformat() if lock_started else "?", age_minutes or 0,
+            )
+            return False
+
+        log.warning(
+            "  Removing stale lock (pid=%s alive=%s age=%s min) and continuing",
+            lock_pid, pid_alive, f"{age_minutes:.0f}" if age_minutes is not None else "?",
+        )
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
+
+    LOCK_FILE.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": datetime.now().isoformat()}),
+        encoding="utf-8",
+    )
+    return True
+
+
+def release_lock():
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except OSError as exc:
+        log.warning("  Could not remove lock file: %s", exc)
+
 
 # ── Group → staff mapping (mirrors full_customer_import.py) ───────────────────
 
@@ -114,16 +262,71 @@ def _extract_phone(text: str) -> str | None:
 
 # ── Status file ────────────────────────────────────────────────────────────────
 
-def _write_status(status: str, detail: dict):
-    """Write last_sync_status.json so the dashboard (or a manual check) can surface it."""
+STATUS_STEPS = ("outstanding", "today_sales", "collections", "sales_history")
+
+
+def _write_status(status: str, steps: dict, detail: "dict | None" = None, dry_run: bool = False):
+    """
+    Write last_sync_status.json AND mirror the same record to the Supabase
+    sync_status table, so a run that half-fails is visible as "partial" rather
+    than the old behaviour of always logging SYNC COMPLETE / status "success"
+    regardless of what actually happened.
+
+    steps: {"outstanding": "success"|"failed"|"skipped", "today_sales": ...,
+            "collections": ..., "sales_history": ...} — see STATUS_STEPS.
+    Carries forward each step's last successful timestamp from the previous
+    run so the dashboard can show e.g. "collections last synced 40 min ago"
+    even on a run where that step failed or didn't run.
+    """
+    detail = detail or {}
+
+    status_path = BASE_DIR / "last_sync_status.json"
+    prev = {}
+    if status_path.exists():
+        try:
+            prev = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("  Could not parse previous %s (%s) — last_success history reset", status_path.name, exc)
+
+    now_iso      = datetime.now().isoformat()
+    last_success = dict(prev.get("last_success", {}))
+    for step in STATUS_STEPS:
+        if steps.get(step) == "success":
+            last_success[step] = now_iso
+
     payload = {
-        "status":    status,
-        "run_ts":    RUN_TS,
-        "timestamp": datetime.now().isoformat(),
+        "status":       status,
+        "run_ts":       RUN_TS,
+        "timestamp":    now_iso,
+        "steps":        steps,
+        "last_success": last_success,
         **detail,
     }
-    status_path = BASE_DIR / "last_sync_status.json"
     status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    if dry_run:
+        log.info("  DRY RUN — sync_status Supabase mirror skipped")
+        return payload
+
+    # Best-effort mirror to Supabase. Table: sync_status (see CLAUDE.md schema —
+    # requires GRANT SELECT ON sync_status TO anon + an RLS policy, same as any
+    # new table). Never let this fail the sync itself.
+    try:
+        supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+        supa.table("sync_status").insert({
+            "run_at":                     now_iso,
+            "status":                     status,
+            "steps":                      steps,
+            "last_success_outstanding":   last_success.get("outstanding"),
+            "last_success_today_sales":   last_success.get("today_sales"),
+            "last_success_collections":   last_success.get("collections"),
+            "last_success_sales_history": last_success.get("sales_history"),
+            "detail":                     detail,
+        }).execute()
+    except Exception as exc:
+        log.warning("  Could not write sync_status to Supabase (non-fatal): %s", exc)
+
+    return payload
 
 
 # ── Email notification ─────────────────────────────────────────────────────────
@@ -232,11 +435,8 @@ def _fetch_tally_ledger_master() -> dict:
         "</DESC></BODY>"
         "</ENVELOPE>"
     )
-    r   = requests.post(
-        TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=90,
-    )
-    xml = r.content.decode("utf-8", errors="replace")
+    raw = _tally_post(xml_body, timeout=TALLY_LEDGER_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
 
     result = {}
     for raw_name, block in re.findall(
@@ -478,16 +678,30 @@ def refresh_ledger_contacts(ledger_data: dict, dry_run: bool = False) -> int:
 
 # ── Step 1: Tally connection check ─────────────────────────────────────────────
 
-def check_tally() -> bool:
+def check_tally(retries: int = 3, backoff_seconds: float = 5.0) -> bool:
+    """
+    Ping Tally. Retries a few times with backoff before giving up — about
+    20% of runs historically failed here with either a refused connection
+    (Tally closed) or a short read timeout (Tally busy on another request),
+    and both are often transient enough that a second try succeeds.
+    """
     log.info("Step 1 — Checking Tally connection at %s", TALLY_URL)
-    try:
-        requests.get(TALLY_URL, timeout=5)
-        log.info("  OK — Tally is reachable")
-        return True
-    except requests.exceptions.ConnectTimeout:
-        log.error("  FAILED — Connection timed out. Are you on the office network?")
-    except requests.exceptions.ConnectionError as exc:
-        log.error("  FAILED — %s", exc)
+    for attempt in range(1, retries + 1):
+        try:
+            requests.get(TALLY_URL, timeout=TALLY_CHECK_TIMEOUT)
+            log.info("  OK — Tally is reachable (attempt %d/%d)", attempt, retries)
+            return True
+        except requests.exceptions.ConnectTimeout:
+            log.warning("  Attempt %d/%d — connection timed out (Tally busy?)", attempt, retries)
+        except requests.exceptions.ConnectionError as exc:
+            log.warning("  Attempt %d/%d — %s", attempt, retries, exc)
+        if attempt < retries:
+            time.sleep(backoff_seconds * attempt)
+    log.error(
+        "  FAILED after %d attempt(s) — Tally unreachable. "
+        "Either Tally is closed, the wrong company is open, or it's too busy to answer.",
+        retries,
+    )
     return False
 
 
@@ -517,11 +731,7 @@ def fetch_tally_xml() -> str:
         "</ENVELOPE>"
     )
 
-    r   = requests.post(
-        TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=TALLY_TIMEOUT,
-    )
-    raw   = r.content
+    raw   = _tally_post(xml_body, timeout=TALLY_TIMEOUT)
     q_pct = raw.count(b"?") / max(len(raw), 1) * 100
     log.info("  Response: %d bytes, %.1f%% question marks", len(raw), q_pct)
 
@@ -828,35 +1038,47 @@ def reload_supabase(bills: list, dry_run: bool = False):
     return inserted, n_skipped, unmatched
 
 
-# ── Step 9: Today's sales from Day Book ───────────────────────────────────────
+# ── Shared: one day of vouchers via TDL Collection ────────────────────────────
+#
+# Step 9 (sales) and Step 9b (collections) fetch the same shape of data for a
+# single day and differ only in which VOUCHERTYPENAME they keep. Step 9b used
+# to use a Day Book EXPORTDATA report instead, which returns one row per
+# ledger entry rather than per voucher — ambiguous for multi-ledger receipts.
+# Both now go through TDL Collection, matching Step 9's approach, with the
+# same client-side hard date filter (Tally's SVFROMDATE/SVTODATE don't
+# reliably constrain TDL Collection results).
 
-def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
+def _fetch_vouchers_for_day(target_date: date, voucher_type_substr: str, collection_id: str) -> list:
     """
-    Fetch sales for target_date (defaults to today) using TDL Collection —
-    one record per voucher, no ledger-entry ambiguity. Upserts to daily_sales.
-    Caller should catch exceptions (non-fatal).
-    """
-    today     = target_date or date.today()
-    today_str = today.strftime("%Y%m%d")
-    log.info("Step 9 — Fetching sales for %s (TDL Collection)", today.isoformat())
+    Fetch one day's vouchers of a given type from Tally. Returns a list of
+    {customer_name, invoice_ref, amount} dicts.
 
+    Raises RuntimeError if the response is implausibly small (e.g. Tally
+    dropped the connection mid-response, or answered with an error page)
+    rather than silently returning an empty list — a genuinely empty but
+    well-formed response is still just as small in bytes for a single-day
+    request, but a *broken* one is smaller still (no ENVELOPE/BODY wrapper).
+    This is what stops a failed fetch from ever being recorded as an honest
+    zero: the caller never even gets a result to upsert, it gets an exception.
+    """
+    day_str  = target_date.strftime("%Y%m%d")
     xml_body = (
         "<ENVELOPE>"
         "<HEADER>"
         "<VERSION>1</VERSION>"
         "<TALLYREQUEST>Export</TALLYREQUEST>"
         "<TYPE>Collection</TYPE>"
-        "<ID>TodaySales</ID>"
+        f"<ID>{collection_id}</ID>"
         "</HEADER>"
         "<BODY><DESC>"
         "<STATICVARIABLES>"
         f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
         "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
-        f"<SVFROMDATE>{today_str}</SVFROMDATE>"
-        f"<SVTODATE>{today_str}</SVTODATE>"
+        f"<SVFROMDATE>{day_str}</SVFROMDATE>"
+        f"<SVTODATE>{day_str}</SVTODATE>"
         "</STATICVARIABLES>"
         "<TDL><TDLMESSAGE>"
-        '<COLLECTION NAME="TodaySales" ISMODIFY="No">'
+        f'<COLLECTION NAME="{collection_id}" ISMODIFY="No">'
         "<TYPE>Voucher</TYPE>"
         "<NATIVEMETHOD>Date</NATIVEMETHOD>"
         "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME</FETCH>"
@@ -865,48 +1087,43 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
         "</DESC></BODY>"
         "</ENVELOPE>"
     )
-    # Step 9 TDL request has been observed taking >30s as FY voucher count grows —
-    # if 90s starts timing out too, the request itself needs to be made lighter
-    # (see July 2026 logs).
-    r   = requests.post(
-        TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=90,
-    )
-    xml = r.content.decode("utf-8", errors="replace")
+    raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    if len(raw) < 200:
+        raise RuntimeError(
+            f"Tally returned only {len(raw)} bytes for {collection_id} on {target_date.isoformat()} "
+            "— treating this as a failed fetch, not a real zero"
+        )
+    xml = raw.decode("utf-8", errors="replace")
 
-    vouchers    = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
-    sales_total = 0.0
-    sales_count = 0
-    items       = []
-
+    items        = []
     skipped_date = 0
-    for v in vouchers:
+    for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
-        if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
+        if not (vtype_m and voucher_type_substr in vtype_m.group(1).upper()):
             continue
 
         ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
         ref   = ref_m.group(1).strip() if ref_m else ""
-        if not ref or ref.startswith("SO-"):
+        # Sales Orders (SO-) aren't real sales — same exclusion Step 9 always had.
+        # Receipts have no equivalent prefix to exclude.
+        if voucher_type_substr == "SALES" and (not ref or ref.startswith("SO-")):
             continue
 
-        # Hard date filter — Tally's SVFROMDATE/SVTODATE don't always constrain
-        # TDL Collection results; parse DATE and reject anything not matching today.
         date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
         voucher_dt = None
         if date_m:
-            raw = date_m.group(1).strip()
+            raw_date = date_m.group(1).strip()
             for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
                 try:
-                    voucher_dt = datetime.strptime(raw, fmt).date()
+                    voucher_dt = datetime.strptime(raw_date, fmt).date()
                     break
                 except ValueError:
                     continue
-        if voucher_dt != today:
+        if voucher_dt != target_date:
             skipped_date += 1
             continue
 
-        amt_m  = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        amt_m = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
         if not amt_m:
             continue
         try:
@@ -915,8 +1132,6 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
             continue
 
         party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
-        sales_total += amt
-        sales_count += 1
         items.append({
             "customer_name": html.unescape(party_m.group(1).strip()) if party_m else "",
             "invoice_ref":   ref,
@@ -924,12 +1139,58 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
         })
 
     if skipped_date:
-        log.info("  Skipped %d voucher(s) with date != %s (Tally returned cross-date records)", skipped_date, today.isoformat())
+        log.info(
+            "  Skipped %d voucher(s) with date != %s (Tally returned cross-date records)",
+            skipped_date, target_date.isoformat(),
+        )
+    return items
 
-    log.info(
-        "  Today's sales: %d invoice(s), Rs %s",
-        sales_count, f"{sales_total:,.2f}",
-    )
+
+def _resolve_customer_ids(supa, items: list) -> int:
+    """Stamp each item's customer_id UUID by name lookup. Returns matched count."""
+    cust_id_map = {}
+    offset = 0
+    while True:
+        batch = (
+            supa.table("customers")
+            .select("id, customer_name")
+            .range(offset, offset + 999)
+            .execute().data
+        )
+        for row in batch:
+            cust_id_map[row["customer_name"].strip().lower()] = row["id"]
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    matched = 0
+    for item in items:
+        cid = cust_id_map.get(item["customer_name"].strip().lower())
+        item["customer_id"] = cid
+        if cid:
+            matched += 1
+    return matched
+
+
+# ── Step 9: Today's sales ──────────────────────────────────────────────────────
+
+def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
+    """
+    Fetch sales for target_date (defaults to today) using TDL Collection —
+    one record per voucher, no ledger-entry ambiguity. Upserts to daily_sales.
+    Caller should catch exceptions (non-fatal) — and must NOT treat a raised
+    exception as "zero sales"; _fetch_vouchers_for_day raises rather than
+    returning an empty list on a broken fetch, so nothing gets upserted here
+    in that case at all.
+    """
+    today = target_date or date.today()
+    log.info("Step 9 — Fetching sales for %s (TDL Collection)", today.isoformat())
+
+    items       = _fetch_vouchers_for_day(today, "SALES", "TodaySales")
+    sales_count = len(items)
+    sales_total = round(sum(i["amount"] for i in items), 2)
+
+    log.info("  Today's sales: %d invoice(s), Rs %s", sales_count, f"{sales_total:,.2f}")
     has_detail = any(i["customer_name"] or i["invoice_ref"] for i in items)
     log.info(
         "  Per-invoice detail: %s",
@@ -939,37 +1200,11 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
 
     if dry_run:
         log.info("  DRY RUN — daily_sales upsert skipped")
-        return sales_count, round(sales_total, 2)
+        return sales_count, sales_total
 
-    supa = create_client(
-        os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SECRET_KEY"],
-    )
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
 
-    # Resolve each PARTYLEDGERNAME to the customer's DB UUID — same map pattern
-    # as Bills Receivable sync. Stored in items so the frontend can do an exact
-    # UUID lookup instead of fragile string matching.
-    cust_id_map = {}
-    offset = 0
-    while True:
-        batch = (
-            supa.table("customers")
-            .select("id, customer_name")
-            .range(offset, offset + 999)
-            .execute().data
-        )
-        for row in batch:
-            cust_id_map[row["customer_name"].strip().lower()] = row["id"]
-        if len(batch) < 1000:
-            break
-        offset += 1000
-
-    matched = 0
-    for item in items:
-        cid = cust_id_map.get(item["customer_name"].strip().lower())
-        item["customer_id"] = cid
-        if cid:
-            matched += 1
+    matched = _resolve_customer_ids(supa, items)
     log.info(
         "  UUID resolved: %d / %d items (%d unmatched — name variation or new customer)",
         matched, len(items), len(items) - matched,
@@ -978,7 +1213,7 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
     supa.table("daily_sales").upsert(
         {
             "sale_date":     today.isoformat(),
-            "total_amount":  round(sales_total, 2),
+            "total_amount":  sales_total,
             "invoice_count": sales_count,
             "synced_at":     datetime.utcnow().isoformat(),
             "items":         items,
@@ -986,133 +1221,41 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
         on_conflict="sale_date",
     ).execute()
     log.info("  daily_sales upserted for %s", today.isoformat())
-    return sales_count, round(sales_total, 2)
+    return sales_count, sales_total
 
 
-# ── Step 9b: Today's collections (Receipt vouchers) → daily_collections ──────
+# ── Step 9b: Today's collections (Receipt vouchers) ───────────────────────────
 
 def sync_today_collections(dry_run: bool = False, target_date: "date | None" = None):
     """
-    Fetch Receipt vouchers for target_date (defaults to today) and upsert to
-    daily_collections. Caller should catch exceptions (non-fatal).
+    Fetch Receipt vouchers for target_date (defaults to today) using the same
+    TDL Collection approach as Step 9 (no more Day Book — that returned one
+    row per ledger entry, ambiguous for multi-ledger receipts). Upserts to
+    daily_collections. Caller should catch exceptions (non-fatal); see the
+    note on sync_today_sales about never treating an exception as a real zero.
     """
-    today     = target_date or date.today()
-    today_str = today.strftime("%Y%m%d")
-    log.info("Step 9b — Fetching collections for %s (Day Book — Receipt vouchers)", today.isoformat())
+    today = target_date or date.today()
+    log.info("Step 9b — Fetching collections for %s (TDL Collection)", today.isoformat())
 
-    xml_body = (
-        "<ENVELOPE>"
-        "<HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>"
-        "<BODY><EXPORTDATA><REQUESTDESC>"
-        "<REPORTNAME>Day Book</REPORTNAME>"
-        "<STATICVARIABLES>"
-        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
-        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
-        f"<SVFROMDATE>{today_str}</SVFROMDATE>"
-        f"<SVTODATE>{today_str}</SVTODATE>"
-        "</STATICVARIABLES>"
-        "</REQUESTDESC></EXPORTDATA></BODY>"
-        "</ENVELOPE>"
-    )
-    # Step 9 TDL request has been observed taking >30s as FY voucher count grows —
-    # if 90s starts timing out too, the request itself needs to be made lighter
-    # (see July 2026 logs).
-    r   = requests.post(
-        TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=90,
-    )
-    xml = r.content.decode("utf-8", errors="replace")
+    items         = _fetch_vouchers_for_day(today, "RECEIPT", "TodayCollections")
+    receipt_count = len(items)
+    collections_total = round(sum(i["amount"] for i in items), 2)
 
-    vouchers          = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
-    collections_total = 0.0
-    receipt_count     = 0
-    skipped_date      = 0
-    items             = []
-
-    for v in vouchers:
-        vtype = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
-        if not (vtype and "RECEIPT" in vtype.group(1).upper()):
-            continue
-
-        # Hard date filter — same fix as Step 9 (Day Book ignores SVFROMDATE/SVTODATE).
-        date_m     = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
-        voucher_dt = None
-        if date_m:
-            raw = date_m.group(1).strip()
-            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
-                try:
-                    voucher_dt = datetime.strptime(raw, fmt).date()
-                    break
-                except ValueError:
-                    continue
-        if voucher_dt != today:
-            skipped_date += 1
-            continue
-
-        receipt_count += 1
-        ref_m   = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
-        amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
-        party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
-        amt = 0.0
-        if amt_m:
-            try:
-                amt = abs(float(amt_m.group(1)))
-            except ValueError:
-                pass
-        collections_total += amt
-        items.append({
-            "customer_name": html.unescape(party_m.group(1).strip()) if party_m else "",
-            "invoice_ref":   ref_m.group(1).strip() if ref_m else "",
-            "amount":        round(amt, 2),
-        })
-
-    if skipped_date:
-        log.info("  Skipped %d receipt(s) with date != %s (Day Book returned cross-date records)", skipped_date, today.isoformat())
-    log.info(
-        "  Today's collections: %d receipt(s), Rs %s",
-        receipt_count, f"{collections_total:,.2f}",
-    )
+    log.info("  Today's collections: %d receipt(s), Rs %s", receipt_count, f"{collections_total:,.2f}")
 
     if dry_run:
         log.info("  DRY RUN — daily_collections upsert skipped")
-        return
+        return receipt_count, collections_total
 
-    supa = create_client(
-        os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SECRET_KEY"],
-    )
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
 
-    # UUID lookup — same pattern as sync_today_sales
-    cust_id_map = {}
-    offset = 0
-    while True:
-        batch = (
-            supa.table("customers")
-            .select("id, customer_name")
-            .range(offset, offset + 999)
-            .execute().data
-        )
-        for row in batch:
-            cust_id_map[row["customer_name"].strip().lower()] = row["id"]
-        if len(batch) < 1000:
-            break
-        offset += 1000
-
-    matched = 0
-    for item in items:
-        cid = cust_id_map.get(item["customer_name"].strip().lower())
-        item["customer_id"] = cid
-        if cid:
-            matched += 1
-    log.info(
-        "  UUID resolved: %d / %d items (%d unmatched)",
-        matched, len(items), len(items) - matched,
-    )
+    matched = _resolve_customer_ids(supa, items)
+    log.info("  UUID resolved: %d / %d items (%d unmatched)", matched, len(items), len(items) - matched)
 
     supa.table("daily_collections").upsert(
         {
             "sale_date":     today.isoformat(),
-            "total_amount":  round(collections_total, 2),
+            "total_amount":  collections_total,
             "invoice_count": receipt_count,
             "synced_at":     datetime.utcnow().isoformat(),
             "items":         items,
@@ -1120,142 +1263,270 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
         on_conflict="sale_date",
     ).execute()
     log.info("  daily_collections upserted for %s", today.isoformat())
+    return receipt_count, collections_total
 
 
-# ── Step 10: Full FY Sales Vouchers → sales_history ───────────────────────────
+# ── Step 10: Sales Vouchers → sales_history (incremental) ─────────────────────
+#
+# Re-fetching the whole FY every 30 minutes is what was overloading Tally: the
+# April chunk alone was 14,161 raw voucher tags and took 60s, and by the time
+# the loop reached June the PC had degraded to connection resets and then
+# outright refused connections. A scheduled run now fetches only the CURRENT
+# month plus one older FY month chosen in rotation (state kept in
+# sync_state.json), so full FY coverage happens gradually across the ~18 runs
+# a day instead of every single run. `--full` still does the complete sweep
+# for a manual refresh. Upserts are keyed on voucher_number and this step
+# never deletes, so a partial/incremental fetch can never lose data — it can
+# only be behind on the months it hasn't gotten to yet this cycle.
 
-def sync_sales_history(dry_run: bool = False):
+def _fy_months(fy_start: date, today: date) -> list:
+    """List of (year, month) tuples from fy_start's month through today's month, inclusive."""
+    months = []
+    y, m = fy_start.year, fy_start.month
+    while date(y, m, 1) <= today:
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return months
+
+
+def _month_bounds(year: int, month: int, today: date) -> "tuple[date, date]":
+    start      = date(year, month, 1)
+    next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    end        = min(next_month - timedelta(days=1), today)
+    return start, end
+
+
+def _note_skip_example(examples: list, ref: str, raw_xml: str):
     """
-    Pull Sales Vouchers for the full current FY from Tally Day Book (by monthly
-    chunk to avoid timeouts) and upsert into sales_history on voucher_number.
-    SO- vouchers (Sales Orders) are filtered out — same rule as daily_sales.
-    Caller should catch exceptions (non-fatal step).
+    Phase 4 debugging aid — keep a small, CC--biased sample of vouchers that
+    were skipped for "no parseable amount tag" so their raw structure can be
+    inspected without guessing. Capped so this never grows unbounded.
+    """
+    is_cc      = bool(ref) and ref.startswith("CC-")
+    cc_count    = sum(1 for e in examples if e["ref"].startswith("CC-"))
+    other_count = len(examples) - cc_count
+    if len(examples) >= 8:
+        return
+    if is_cc and cc_count >= 3:
+        return
+    if not is_cc and other_count >= 5:
+        return
+    examples.append({"ref": ref or "(no voucher number)", "raw_xml": raw_xml})
+
+
+def _write_skip_examples_debug_file(examples: list):
+    if not examples:
+        return
+    debug_path = BASE_DIR / "debug_skipped_vouchers.xml"
+    lines = [
+        f"<!-- {len(examples)} example(s) skipped in Step 10 for 'no parseable amount tag' -->",
+        f"<!-- Captured {datetime.now().isoformat()} -->",
+        "",
+    ]
+    for ex in examples:
+        lines.append(f"<!-- voucher_number: {ex['ref']} -->")
+        lines.append(ex["raw_xml"])
+        lines.append("")
+    debug_path.write_text("\n".join(lines), encoding="utf-8")
+    log.warning(
+        "  Saved %d skipped-voucher example(s) to %s for inspection",
+        len(examples), debug_path.name,
+    )
+
+
+def _parse_qty(raw: str):
+    n = re.sub(r"[^0-9.]", "", raw.strip().split(" ")[0])
+    try:    return round(float(n), 3)
+    except: return None  # noqa: E722
+
+
+def _parse_rate(raw: str):
+    n = re.sub(r"[^0-9.]", "", raw.strip().split("/")[0])
+    try:    return round(float(n), 2)
+    except: return None  # noqa: E722
+
+
+def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: list) -> list:
+    """
+    Fetch + parse one month's Sales vouchers from Tally. Returns a list of
+    record dicts (possibly empty). Never raises for a single bad chunk — a
+    timeout or connection failure on one month must not abort the months
+    still queued behind it, so this logs a warning and returns [] instead.
+    """
+    from_date, to_date = _month_bounds(year, month, today)
+    from_str = from_date.strftime("%Y%m%d")
+    to_str   = to_date.strftime("%Y%m%d")
+    log.info("  Chunk %s – %s", from_str, to_str)
+
+    xml_body = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>SalesHistory</ID>"
+        "</HEADER>"
+        "<BODY><DESC>"
+        "<STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"<SVFROMDATE>{from_str}</SVFROMDATE>"
+        f"<SVTODATE>{to_str}</SVTODATE>"
+        "</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        '<COLLECTION NAME="SalesHistory" ISMODIFY="No">'
+        "<TYPE>Voucher</TYPE>"
+        "<NATIVEMETHOD>Date</NATIVEMETHOD>"
+        "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME,"
+        " STOCKITEMNAME, ACTUALQTY, RATE</FETCH>"
+        "</COLLECTION>"
+        "</TDLMESSAGE></TDL>"
+        "</DESC></BODY>"
+        "</ENVELOPE>"
+    )
+    try:
+        raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    except requests.exceptions.RequestException as exc:
+        # Covers Timeout AND ConnectionError (incl. resets/refusals) — a prior
+        # version only caught Timeout, so a mid-loop ConnectionResetError would
+        # propagate out and abandon every month still queued behind it.
+        log.warning("  Chunk %s–%s failed (%s) — skipping this month, will retry next rotation", from_str, to_str, exc)
+        return []
+
+    xml = raw.decode("utf-8", errors="replace")
+    records     = []
+    vouchers    = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
+    raw_count   = len(vouchers)
+    after_sales = 0
+    after_so    = 0
+    synced_at   = datetime.utcnow().isoformat()
+
+    for v in vouchers:
+        vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+        if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
+            continue
+        after_sales += 1
+        ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
+        ref   = ref_m.group(1).strip() if ref_m else None
+        if not ref or ref.startswith("SO-"):
+            continue
+        after_so += 1
+
+        date_m  = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
+        amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        stock_m = re.search(r"<STOCKITEMNAME[^>]*>(.*?)</STOCKITEMNAME>", v)
+        qty_m   = re.search(r"<ACTUALQTY[^>]*>(.*?)</ACTUALQTY>", v)
+        rate_m  = re.search(r"<RATE[^>]*>(.*?)</RATE>", v)
+
+        sale_date = None
+        if date_m:
+            raw_date_str = date_m.group(1).strip()
+            for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
+                try:
+                    sale_date = datetime.strptime(raw_date_str, fmt).date().isoformat()
+                    break
+                except ValueError:
+                    continue
+
+        amount = None
+        if amt_m:
+            try:    amount = round(abs(float(amt_m.group(1))), 2)
+            except: pass  # noqa: E722
+        if amount is None:
+            log.warning("  Skipping %s — no parseable amount tag", ref)
+            _note_skip_example(skip_examples, ref, v)
+            continue
+
+        records.append({
+            "voucher_number": ref,
+            "sale_date":      sale_date,
+            "customer_name":  html.unescape(party_m.group(1).strip()) if party_m else None,
+            "amount":         amount,
+            "stock_item":     html.unescape(stock_m.group(1).strip()) if stock_m else None,
+            "quantity":       _parse_qty(qty_m.group(1))  if qty_m  else None,
+            "rate":           _parse_rate(rate_m.group(1)) if rate_m else None,
+            "voucher_type":   vtype_m.group(1).strip(),
+            "synced_at":      synced_at,
+        })
+
+    log.info(
+        "  Chunk: %d raw VOUCHER tags | %d after SALES filter | %d after SO- filter | %d added",
+        raw_count, after_sales, after_so, len(records),
+    )
+    return records
+
+
+def _pick_incremental_months(fy_start: date, today: date) -> list:
+    """
+    Decide which (year, month) chunks a scheduled run should fetch: the
+    current month always; the previous month too for the first
+    NEW_MONTH_CATCHUP_RUNS runs after a month rollover (catches late entries);
+    and one older FY month chosen in rotation so the full FY gets covered
+    gradually across a day's worth of runs. Persists rotation state to
+    STATE_FILE — caller decides whether to actually save (skipped in dry-run).
+    """
+    all_months   = _fy_months(fy_start, today)
+    current      = (today.year, today.month)
+    month_key    = f"{today.year:04d}-{today.month:02d}"
+
+    state = _load_state()
+    if state.get("last_seen_month") != month_key:
+        state["last_seen_month"]     = month_key
+        state["new_month_runs_done"] = 0
+
+    months = [current]
+
+    prev_month = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+    if prev_month in all_months and prev_month != current:
+        if state.get("new_month_runs_done", 0) < NEW_MONTH_CATCHUP_RUNS:
+            months.append(prev_month)
+            state["new_month_runs_done"] = state.get("new_month_runs_done", 0) + 1
+
+    older = [m for m in all_months if m not in months]
+    if older:
+        idx = state.get("rotation_index", 0) % len(older)
+        months.append(older[idx])
+        state["rotation_index"] = state.get("rotation_index", 0) + 1
+
+    return months, state
+
+
+def sync_sales_history(dry_run: bool = False, full: bool = False):
+    """
+    Upsert Sales Vouchers into sales_history, keyed on voucher_number.
+    Normal runs only touch the current month + a rotating older FY month
+    (see module docstring above Step 10). Pass full=True (the --full CLI
+    flag) for a complete FY sweep. Caller should catch exceptions (non-fatal
+    step) — a single bad month chunk is already handled internally and never
+    aborts the others.
     """
     fy_start = _fy_start()
     today    = date.today()
-    log.info("Step 10 — Fetching Sales Vouchers FY %s → %s (monthly chunks)", fy_start, today)
 
-    def _parse_qty(raw: str):
-        n = re.sub(r"[^0-9.]", "", raw.strip().split(" ")[0])
-        try:    return round(float(n), 3)
-        except: return None  # noqa: E722
+    skip_examples = []
 
-    def _parse_rate(raw: str):
-        n = re.sub(r"[^0-9.]", "", raw.strip().split("/")[0])
-        try:    return round(float(n), 2)
-        except: return None  # noqa: E722
+    if full:
+        months_to_fetch = _fy_months(fy_start, today)
+        log.info("Step 10 — FULL FY refresh (--full): %d month(s), %s → %s", len(months_to_fetch), fy_start, today)
+    else:
+        months_to_fetch, state = _pick_incremental_months(fy_start, today)
+        if not dry_run:
+            _save_state(state)
+        log.info(
+            "Step 10 — incremental sync: %s%s",
+            [f"{y}-{m:02d}" for y, m in months_to_fetch],
+            " (state not persisted — dry run)" if dry_run else "",
+        )
 
     all_records = []
-    current     = fy_start
+    for (y, m) in months_to_fetch:
+        all_records.extend(_fetch_sales_month_chunk(y, m, today, skip_examples))
 
-    while current <= today:
-        next_month = (
-            date(current.year + 1, 1, 1) if current.month == 12
-            else date(current.year, current.month + 1, 1)
-        )
-        chunk_end = min(next_month - timedelta(days=1), today)
-        from_str  = current.strftime("%Y%m%d")
-        to_str    = chunk_end.strftime("%Y%m%d")
-        log.info("  Chunk %s – %s", from_str, to_str)
-
-        xml_body = (
-            "<ENVELOPE>"
-            "<HEADER>"
-            "<VERSION>1</VERSION>"
-            "<TALLYREQUEST>Export</TALLYREQUEST>"
-            "<TYPE>Collection</TYPE>"
-            "<ID>SalesHistory</ID>"
-            "</HEADER>"
-            "<BODY><DESC>"
-            "<STATICVARIABLES>"
-            f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
-            "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
-            f"<SVFROMDATE>{from_str}</SVFROMDATE>"
-            f"<SVTODATE>{to_str}</SVTODATE>"
-            "</STATICVARIABLES>"
-            "<TDL><TDLMESSAGE>"
-            '<COLLECTION NAME="SalesHistory" ISMODIFY="No">'
-            "<TYPE>Voucher</TYPE>"
-            "<NATIVEMETHOD>Date</NATIVEMETHOD>"
-            "<FETCH>DATE, VOUCHERNUMBER, PARTYLEDGERNAME, AMOUNT, VOUCHERTYPENAME,"
-            " STOCKITEMNAME, ACTUALQTY, RATE</FETCH>"
-            "</COLLECTION>"
-            "</TDLMESSAGE></TDL>"
-            "</DESC></BODY>"
-            "</ENVELOPE>"
-        )
-        try:
-            r   = requests.post(
-                TALLY_URL, data=xml_body.encode("utf-8"),
-                headers={"Content-Type": "text/xml"}, timeout=60,
-            )
-            xml = r.content.decode("utf-8", errors="replace")
-        except requests.exceptions.Timeout:
-            log.warning("  Chunk %s–%s timed out — skipping", from_str, to_str)
-            current = next_month
-            continue
-
-        vouchers    = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
-        raw_count   = len(vouchers)
-        after_sales = 0
-        after_so    = 0
-        chunk_count = 0
-        synced_at   = datetime.utcnow().isoformat()
-
-        for v in vouchers:
-            vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
-            if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
-                continue
-            after_sales += 1
-            ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
-            ref   = ref_m.group(1).strip() if ref_m else None
-            if not ref or ref.startswith("SO-"):
-                continue
-            after_so += 1
-
-            date_m  = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
-            party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
-            amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
-            stock_m = re.search(r"<STOCKITEMNAME[^>]*>(.*?)</STOCKITEMNAME>", v)
-            qty_m   = re.search(r"<ACTUALQTY[^>]*>(.*?)</ACTUALQTY>", v)
-            rate_m  = re.search(r"<RATE[^>]*>(.*?)</RATE>", v)
-
-            sale_date = None
-            if date_m:
-                raw = date_m.group(1).strip()
-                for fmt in ("%Y%m%d", "%d-%b-%y", "%d-%b-%Y"):
-                    try:
-                        sale_date = datetime.strptime(raw, fmt).date().isoformat()
-                        break
-                    except ValueError:
-                        continue
-
-            amount = None
-            if amt_m:
-                try:    amount = round(abs(float(amt_m.group(1))), 2)
-                except: pass  # noqa: E722
-            if amount is None:
-                log.warning("  Skipping %s — no parseable amount tag", ref)
-                continue
-
-            all_records.append({
-                "voucher_number": ref,
-                "sale_date":      sale_date,
-                "customer_name":  html.unescape(party_m.group(1).strip()) if party_m else None,
-                "amount":         amount,
-                "stock_item":     html.unescape(stock_m.group(1).strip()) if stock_m else None,
-                "quantity":       _parse_qty(qty_m.group(1))  if qty_m  else None,
-                "rate":           _parse_rate(rate_m.group(1)) if rate_m else None,
-                "voucher_type":   vtype_m.group(1).strip(),
-                "synced_at":      synced_at,
-            })
-            chunk_count += 1
-
-        log.info(
-            "  Chunk: %d raw VOUCHER tags | %d after SALES filter | %d after SO- filter | %d added",
-            raw_count, after_sales, after_so, chunk_count,
-        )
-        current = next_month
+    _write_skip_examples_debug_file(skip_examples)
 
     log.info("  Total records collected (before dedup): %d", len(all_records))
     if all_records:
@@ -1399,11 +1670,8 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
         "</DESC></BODY>"
         "</ENVELOPE>"
     )
-    r   = requests.post(
-        TALLY_URL, data=xml_body.encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=30,
-    )
-    xml    = r.content.decode("utf-8", errors="replace")
+    raw    = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    xml    = raw.decode("utf-8", errors="replace")
     target = datetime.strptime(date_str, "%Y%m%d").date()
     count  = 0
     for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
@@ -1437,43 +1705,64 @@ def _fetch_tally_voucher_count(date_str: str) -> int:
     return count
 
 
-def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fetched_count: int):
+def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fetched_count: int) -> str:
     """
     Post-sync safety check (non-fatal — caller must catch exceptions):
     1. Voucher count: re-fetches count from Tally independently and compares
-       against fetched_count. Retries once on mismatch; raises RuntimeError
-       if still mismatched after retry.
+       against fetched_count. Retries once on mismatch.
     2. Step 9 vs Step 10 cross-check: if totals differ by more than ₹1,
        logs a per-voucher mismatch report pulling from daily_sales + sales_history.
+
+    Status is tri-state, not just OK/MISMATCH — if Tally can't be reached for
+    the independent count check, that is reported as UNKNOWN rather than
+    silently defaulting to OK. That silent-default-to-OK was the actual bug:
+    the old count_ok flag started True and an exception in the count fetch
+    never flipped it, so a run where Tally was unreachable for this check
+    still logged "STATUS: OK".
+
+    Only raises (fatal to the caller's try/except, logged as a warning
+    upstream) on a genuine confirmed MISMATCH — never on UNKNOWN, since not
+    being able to reach Tally for a secondary check isn't itself a data
+    problem.
+
     Log format:
-      [RECONCILE] Date: {date} | Vouchers: {fetched}/{tally} | Step9: ₹{x} | Step10: ₹{y} | STATUS: OK/MISMATCH
+      [RECONCILE] Date: {date} | Vouchers: {fetched}/{tally} | Step9: ₹{x} | Step10: ₹{y} | STATUS: OK/MISMATCH/UNKNOWN
     """
     date_str = sync_date.strftime("%Y%m%d")
 
     # ── 1. Voucher count check ────────────────────────────────────────────────
-    tally_count = None
-    count_ok    = True
+    tally_count  = None
+    count_status = "unknown"   # "ok" | "mismatch" | "unknown"
     try:
         tally_count = _fetch_tally_voucher_count(date_str)
-        if tally_count != fetched_count:
+        if tally_count == fetched_count:
+            count_status = "ok"
+        else:
             log.warning(
                 "[RECONCILE] Count mismatch — fetched %d, Tally reports %d — retrying",
                 fetched_count, tally_count,
             )
             tally_count = _fetch_tally_voucher_count(date_str)
-            if tally_count != fetched_count:
-                count_ok = False
+            count_status = "ok" if tally_count == fetched_count else "mismatch"
+            if count_status == "mismatch":
                 log.error(
                     "[RECONCILE] Count still mismatched after retry (fetched=%d, tally=%d)",
                     fetched_count, tally_count,
                 )
     except Exception as exc:
-        log.warning("[RECONCILE] Could not fetch Tally count: %s", exc)
+        log.warning("[RECONCILE] Could not fetch Tally count — STATUS will be UNKNOWN, not OK: %s", exc)
+        count_status = "unknown"
 
     # ── 2. Step 9 vs Step 10 total cross-check ───────────────────────────────
     diff     = abs(step9_total - step10_total)
     total_ok = diff <= 1.0
-    status   = "OK" if (count_ok and total_ok) else "MISMATCH"
+
+    if count_status == "unknown":
+        status = "UNKNOWN"
+    elif count_status == "mismatch" or not total_ok:
+        status = "MISMATCH"
+    else:
+        status = "OK"
 
     log.info(
         "[RECONCILE] Date: %s | Vouchers: %d/%s | Step9: ₹%s | Step10: ₹%s | STATUS: %s",
@@ -1517,11 +1806,13 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
         except Exception as exc:
             log.warning("[RECONCILE] Could not fetch per-voucher detail: %s", exc)
 
-    if not count_ok:
+    if count_status == "mismatch":
         raise RuntimeError(
             f"[RECONCILE] Voucher count mismatch for {sync_date}: "
             f"fetched={fetched_count}, tally={tally_count}"
         )
+
+    return status
 
 
 # ── Backfill ───────────────────────────────────────────────────────────────────
@@ -1600,6 +1891,7 @@ def main():
     parser = argparse.ArgumentParser(description="SBDC Tally → Supabase sync")
     parser.add_argument("--dry-run",    action="store_true", help="Parse without DB writes")
     parser.add_argument("--from-local", action="store_true", help="Use tally_with_dates.xml instead of live Tally")
+    parser.add_argument("--full",       action="store_true", help="Full FY sales_history sweep instead of the incremental current+rotation months")
     parser.add_argument("--backfill",   action="store_true", help="Backfill daily_sales/collections for a date range")
     parser.add_argument("--from",       dest="from_date", metavar="YYYY-MM-DD", help="Backfill start date (inclusive)")
     parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
@@ -1609,136 +1901,182 @@ def main():
     dry_run    = args.dry_run
     from_local = args.from_local
 
-    # ── Backfill mode ─────────────────────────────────────────────────────────
-    if args.backfill:
-        if not args.from_date or not args.to_date:
-            parser.error("--backfill requires --from YYYY-MM-DD and --to YYYY-MM-DD")
-        try:
-            from_date = date.fromisoformat(args.from_date)
-            to_date   = date.fromisoformat(args.to_date)
-        except ValueError as exc:
-            parser.error(f"Invalid date: {exc}")
-        if from_date > to_date:
-            parser.error("--from date must be on or before --to date")
-
-        log.info("=" * 60)
-        log.info("SUPREME BALAJI — BACKFILL MODE")
-        log.info("  Range : %s → %s", args.from_date, args.to_date)
-        log.info("  Force : %s", args.force)
-        if dry_run: log.info("  DRY RUN — no DB writes")
-        log.info("  Run   : %s", RUN_TS)
-        log.info("=" * 60)
-
-        try:
-            backfill_mode(from_date, to_date, force=args.force, dry_run=dry_run)
-        except Exception as exc:
-            log.exception("BACKFILL FAILED: %s", exc)
-            sys.exit(1)
-        return
-
-    # ── Normal sync mode ──────────────────────────────────────────────────────
-    log.info("=" * 60)
-    log.info("SUPREME BALAJI — TALLY OUTSTANDING SYNC")
-    if from_local: log.info("  MODE: FROM LOCAL FILE (no Tally connection)")
-    if dry_run:    log.info("  MODE: DRY RUN (Supabase writes skipped)")
-    log.info("  Run: %s", RUN_TS)
-    log.info("=" * 60)
+    if not acquire_lock():
+        # Another run is genuinely still in progress — exit cleanly, not a failure.
+        # (Task Scheduler treats a non-zero exit as a failed run; overlap isn't one.)
+        sys.exit(0)
 
     try:
-        if from_local:
-            local_xml = BASE_DIR / "tally_with_dates.xml"
-            if not local_xml.exists():
-                raise FileNotFoundError(
-                    "--from-local specified but tally_with_dates.xml not found in backend/"
-                )
-            log.info("Steps 1-2 — SKIPPED (--from-local mode)")
-            log.info("  Reading: %s", local_xml)
-            xml_text = local_xml.read_text(encoding="utf-8", errors="replace")
-        else:
-            if not check_tally():
-                raise RuntimeError(
-                    "Tally not reachable. Run from the office network with Tally open."
-                )
-            xml_text = fetch_tally_xml()
-
-        bills = parse_xml(xml_text)
-
-        # Steps 4.5 + 4.6 — fetch ledger master once, use for both new-customer
-        # insert and contact-field refresh (avoids a second round-trip to Tally).
-        auto_inserted = []
-        if not from_local:
+        # ── Backfill mode ─────────────────────────────────────────────────────
+        if args.backfill:
+            if not args.from_date or not args.to_date:
+                parser.error("--backfill requires --from YYYY-MM-DD and --to YYYY-MM-DD")
             try:
-                log.info("Step 4.5/4.6 — Fetching Tally ledger master")
-                ledger_data = _fetch_tally_ledger_master()
-                log.info("  Ledger master: %d records fetched", len(ledger_data))
-                auto_inserted = auto_insert_new_customers(bills, ledger_data=ledger_data, dry_run=dry_run)
-                refresh_ledger_contacts(ledger_data, dry_run=dry_run)
+                from_date = date.fromisoformat(args.from_date)
+                to_date   = date.fromisoformat(args.to_date)
+            except ValueError as exc:
+                parser.error(f"Invalid date: {exc}")
+            if from_date > to_date:
+                parser.error("--from date must be on or before --to date")
+
+            log.info("=" * 60)
+            log.info("SUPREME BALAJI — BACKFILL MODE")
+            log.info("  Range : %s → %s", args.from_date, args.to_date)
+            log.info("  Force : %s", args.force)
+            if dry_run: log.info("  DRY RUN — no DB writes")
+            log.info("  Run   : %s", RUN_TS)
+            log.info("=" * 60)
+
+            try:
+                backfill_mode(from_date, to_date, force=args.force, dry_run=dry_run)
             except Exception as exc:
-                log.warning(
-                    "Step 4.5/4.6 WARNING — Ledger sync failed (non-fatal): %s", exc
-                )
+                log.exception("BACKFILL FAILED: %s", exc)
+                sys.exit(1)
+            return
 
-        inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
+        # ── Normal sync mode ──────────────────────────────────────────────────
+        log.info("=" * 60)
+        log.info("SUPREME BALAJI — TALLY OUTSTANDING SYNC")
+        if from_local:  log.info("  MODE: FROM LOCAL FILE (no Tally connection)")
+        if dry_run:     log.info("  MODE: DRY RUN (Supabase writes skipped)")
+        if args.full:   log.info("  MODE: FULL FY sales_history sweep (--full)")
+        log.info("  Run: %s", RUN_TS)
+        log.info("=" * 60)
 
-        summary = {
-            "bills_from_tally":    len(bills),
-            "loaded_to_supabase":  inserted,
-            "skipped_no_match":    skipped,
-            "new_customers_added": len(auto_inserted),
-            "new_customer_names":  auto_inserted,
-            "skipped_names":       [
-                {"name": n, "bills": c} for n, c in sorted(unmatched.items(), key=lambda x: -x[1])
-            ],
+        # Per-step status — the honest record of what actually happened this run,
+        # instead of a single "success" that used to be written even when Tally
+        # was never reached for Steps 9/9b/10. "skipped" covers --from-local,
+        # where these steps deliberately don't run at all.
+        step_status = {
+            "outstanding":   "pending",
+            "today_sales":   "skipped",
+            "collections":   "skipped",
+            "sales_history": "skipped",
         }
-        _write_status("success", summary)
+        reconcile_status = None
 
-        if unmatched:
-            log.warning("  Sending skip alert for %d unmatched customer(s)", len(unmatched))
-            _send_skip_alert_email(unmatched)
+        try:
+            if from_local:
+                local_xml = BASE_DIR / "tally_with_dates.xml"
+                if not local_xml.exists():
+                    raise FileNotFoundError(
+                        "--from-local specified but tally_with_dates.xml not found in backend/"
+                    )
+                log.info("Steps 1-2 — SKIPPED (--from-local mode)")
+                log.info("  Reading: %s", local_xml)
+                xml_text = local_xml.read_text(encoding="utf-8", errors="replace")
+            else:
+                if not check_tally():
+                    raise RuntimeError(
+                        "Tally not reachable. Run from the office network with Tally open."
+                    )
+                xml_text = fetch_tally_xml()
 
-        step9_count, step9_total, step10_today = 0, 0.0, 0.0
-        if not from_local:
-            try:
-                step9_count, step9_total = sync_today_sales(dry_run=dry_run)
-            except Exception as exc:
-                log.warning("Step 9 WARNING — Today's sales sync failed (non-fatal): %s", exc)
+            bills = parse_xml(xml_text)
 
-        if not from_local:
-            try:
-                sync_today_collections(dry_run=dry_run)
-            except Exception as exc:
-                log.warning("Step 9b WARNING — Today's collections sync failed (non-fatal): %s", exc)
+            # Steps 4.5 + 4.6 — fetch ledger master once, use for both new-customer
+            # insert and contact-field refresh (avoids a second round-trip to Tally).
+            auto_inserted = []
+            if not from_local:
+                try:
+                    log.info("Step 4.5/4.6 — Fetching Tally ledger master")
+                    ledger_data = _fetch_tally_ledger_master()
+                    log.info("  Ledger master: %d records fetched", len(ledger_data))
+                    auto_inserted = auto_insert_new_customers(bills, ledger_data=ledger_data, dry_run=dry_run)
+                    refresh_ledger_contacts(ledger_data, dry_run=dry_run)
+                except Exception as exc:
+                    log.warning(
+                        "Step 4.5/4.6 WARNING — Ledger sync failed (non-fatal): %s", exc
+                    )
 
-        if not from_local:
-            try:
-                step10_today = sync_sales_history(dry_run=dry_run) or 0.0
-            except Exception as exc:
-                log.warning("Step 10 WARNING — Sales history sync failed (non-fatal): %s", exc)
+            inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
+            step_status["outstanding"] = "success"
 
-        if not from_local and not dry_run:
-            try:
-                reconcile_sync(date.today(), step9_total, step10_today, step9_count)
-            except Exception as exc:
-                log.warning("RECONCILE WARNING — Post-sync check failed (non-fatal): %s", exc)
+            if unmatched:
+                log.warning("  Sending skip alert for %d unmatched customer(s)", len(unmatched))
+                _send_skip_alert_email(unmatched)
 
-        log.info("=" * 60)
-        log.info("SYNC COMPLETE%s", " (DRY RUN)" if dry_run else "")
-        log.info("  Bills from Tally       : %d", len(bills))
-        log.info("  New customers added    : %d%s",
-                 len(auto_inserted),
-                 (" — " + ", ".join(auto_inserted)) if auto_inserted else "")
-        log.info("  Loaded to Supabase     : %d", inserted)
-        log.info("  Skipped (no match)     : %d", skipped)
-        log.info("  Log: %s", log_path)
-        log.info("=" * 60)
+            step9_count, step9_total, step10_today = 0, 0.0, 0.0
+            if not from_local:
+                try:
+                    step9_count, step9_total = sync_today_sales(dry_run=dry_run)
+                    step_status["today_sales"] = "success"
+                except Exception as exc:
+                    log.warning("Step 9 WARNING — Today's sales sync failed (non-fatal): %s", exc)
+                    step_status["today_sales"] = "failed"
 
-    except Exception as exc:
-        error_msg = str(exc)
-        log.exception("SYNC FAILED: %s", error_msg)
-        log.error("Log saved to: %s", log_path)
-        _write_status("failed", {"error": error_msg, "log": str(log_path)})
-        _send_failure_email(error_msg)
-        sys.exit(1)
+                try:
+                    sync_today_collections(dry_run=dry_run)
+                    step_status["collections"] = "success"
+                except Exception as exc:
+                    log.warning("Step 9b WARNING — Today's collections sync failed (non-fatal): %s", exc)
+                    step_status["collections"] = "failed"
+
+                try:
+                    step10_today = sync_sales_history(dry_run=dry_run, full=args.full) or 0.0
+                    step_status["sales_history"] = "success"
+                except Exception as exc:
+                    log.warning("Step 10 WARNING — Sales history sync failed (non-fatal): %s", exc)
+                    step_status["sales_history"] = "failed"
+
+                if not dry_run:
+                    try:
+                        reconcile_status = reconcile_sync(date.today(), step9_total, step10_today, step9_count)
+                    except Exception as exc:
+                        log.warning("RECONCILE WARNING — Post-sync check failed (non-fatal): %s", exc)
+                        reconcile_status = "MISMATCH"
+
+            # ── Overall status ──────────────────────────────────────────────────
+            # "success" only if every step that was supposed to run this mode did;
+            # a confirmed reconcile MISMATCH also downgrades to "partial" even if
+            # every individual step nominally succeeded, since it means the data
+            # those steps wrote doesn't actually agree with itself.
+            core_steps_ok = all(
+                step_status[s] in ("success", "skipped") for s in ("today_sales", "collections", "sales_history")
+            )
+            if core_steps_ok and reconcile_status != "MISMATCH":
+                overall_status = "success"
+            else:
+                overall_status = "partial"
+
+            summary = {
+                "bills_from_tally":    len(bills),
+                "loaded_to_supabase":  inserted,
+                "skipped_no_match":    skipped,
+                "new_customers_added": len(auto_inserted),
+                "new_customer_names":  auto_inserted,
+                "skipped_names":       [
+                    {"name": n, "bills": c} for n, c in sorted(unmatched.items(), key=lambda x: -x[1])
+                ],
+                "reconcile_status":    reconcile_status,
+            }
+            _write_status(overall_status, step_status, summary, dry_run=dry_run)
+
+            log.info("=" * 60)
+            log.info("SYNC %s%s", overall_status.upper(), " (DRY RUN)" if dry_run else "")
+            log.info("  Bills from Tally       : %d", len(bills))
+            log.info("  New customers added    : %d%s",
+                     len(auto_inserted),
+                     (" — " + ", ".join(auto_inserted)) if auto_inserted else "")
+            log.info("  Loaded to Supabase     : %d", inserted)
+            log.info("  Skipped (no match)     : %d", skipped)
+            log.info("  Step status            : %s", step_status)
+            if reconcile_status:
+                log.info("  Reconcile              : %s", reconcile_status)
+            log.info("  Log: %s", log_path)
+            log.info("=" * 60)
+
+        except Exception as exc:
+            error_msg = str(exc)
+            log.exception("SYNC FAILED: %s", error_msg)
+            log.error("Log saved to: %s", log_path)
+            step_status["outstanding"] = "failed"
+            _write_status("failed", step_status, {"error": error_msg, "log": str(log_path)}, dry_run=dry_run)
+            _send_failure_email(error_msg)
+            sys.exit(1)
+
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
