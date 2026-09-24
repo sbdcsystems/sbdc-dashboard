@@ -396,16 +396,27 @@ def _write_status(status: str, steps: dict, detail: "dict | None" = None, dry_ru
         except Exception as exc:
             log.warning("  Could not parse previous %s (%s) — last_success history reset", status_path.name, exc)
 
-    now_iso      = datetime.now().isoformat()
-    last_success = dict(prev.get("last_success", {}))
+    # BUG FIX: this used to be datetime.now().isoformat() — a naive local
+    # (IST, on the office PC) timestamp with no offset in the string.
+    # Postgres has no way to know that "18:31:28" meant IST, so a timestamptz
+    # column stored it as 18:31:28 UTC — 5.5 hours off from the real instant.
+    # `now_local_iso` (naive) is kept only for last_sync_status.json's own
+    # "timestamp" field, which is a local log-style value nobody but a human
+    # reading that file locally ever looks at (same convention as RUN_TS).
+    # Everything that round-trips through Supabase — run_at and every
+    # last_success_* column, all `timestamptz` — must use the aware
+    # `now_utc_iso` instead.
+    now_utc_iso   = datetime.now(UTC).isoformat()
+    now_local_iso = datetime.now().isoformat()
+    last_success  = dict(prev.get("last_success", {}))
     for step in STATUS_STEPS:
         if steps.get(step) == "success":
-            last_success[step] = now_iso
+            last_success[step] = now_utc_iso
 
     payload = {
         "status":       status,
         "run_ts":       RUN_TS,
-        "timestamp":    now_iso,
+        "timestamp":    now_local_iso,
         "steps":        steps,
         "last_success": last_success,
         **detail,
@@ -422,7 +433,7 @@ def _write_status(status: str, steps: dict, detail: "dict | None" = None, dry_ru
     try:
         supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
         supa.table("sync_status").insert({
-            "run_at":                     now_iso,
+            "run_at":                     now_utc_iso,
             "status":                     status,
             "steps":                      steps,
             "last_success_outstanding":   last_success.get("outstanding"),

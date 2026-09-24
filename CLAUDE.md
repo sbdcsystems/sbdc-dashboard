@@ -331,6 +331,8 @@ Step 4.5 is also non-fatal and **skipped in `--from-local` mode** (can't reach T
 
 **RECONCILE tri-state**: the post-sync voucher-count cross-check reports `OK`, `MISMATCH`, or `UNKNOWN` — previously an exception while fetching Tally's independent count silently left the status at `OK` (the `count_ok` flag defaulted `True` and nothing set it `False` on that path). `UNKNOWN` doesn't fail the run; a confirmed `MISMATCH` downgrades the overall run status to `partial`.
 
+**Timestamp rule — any value written to a Supabase `timestamptz` column must be timezone-aware** (`datetime.now(UTC)`, not `datetime.now()`). A naive local datetime's `.isoformat()` has no offset in the string, so Postgres has no way to know it was IST and stores it as if it were UTC — a real bug caught in `_write_status()`: `sync_status.run_at` for an 18:31 IST run was stored as `18:31:28+00`, 5.5 hours off. Fixed by splitting it into `now_utc_iso` (aware — used for `run_at` and every `last_success_*` column) and `now_local_iso` (naive — used only for `last_sync_status.json`'s own `"timestamp"` field, a local log-style value nobody reads except a human on that machine, same convention as `RUN_TS`). Values that never reach Supabase (`sync.lock`'s `started_at`, `RUN_TS`, email body/subject text, the XML-backup retention cutoff) are fine staying naive local — the bug is specifically about the round trip through a `timestamptz` column.
+
 ---
 
 ## Tally group → staff assignment mapping
