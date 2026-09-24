@@ -19,6 +19,7 @@ backend/last_sync_status.json
 backend/parsed_outstanding.json
 backend/ledger_master_parsed.json
 backend/*.txt
+!backend/requirements.txt
 backend/sync_state.json
 backend/sync.lock
 
