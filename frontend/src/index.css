@@ -1,35 +1,48 @@
-:root {
-  --bg:           #FAF9F6;
-  --surface:      #FFFFFF;
-  --border:       #E7E4DC;
-  --border-soft:  #F0EEE7;
-
-  --text-primary:   #1A1A18;
-  --text-secondary: #6B6A64;
-  --text-tertiary:  #A3A19A;
-
-  --red:       #A6342A;
-  --red-soft:  #F7E5E3;
-  --red-text:  #7C271F;
-
-  --teal:      #1C7A5C;
-  --teal-soft: #E1F1EA;
-  --teal-text: #155E47;
-
-  --indigo:      #2C4A7C;
-  --indigo-soft: #E5EBF4;
-
-  --amber:      #B07A2E;
-  --amber-soft: #F7EEDD;
-
-  --purple:      #6B4C8A;
-  --purple-soft: #EFE7F3;
-
-  --coral:      #C9603A;
-  --coral-soft: #FAEAE2;
-
-  --font-sans: 'Manrope', sans-serif;
-  --font-mono: 'IBM Plex Mono', monospace;
+:root{
+  --bg:#eceef5; --cell:#FFFFFF; --cell2:#F2F2F7;
+  --label:#000; --label2:rgba(60,60,67,.6); --label3:rgba(60,60,67,.3);
+  --sep:rgba(60,60,67,.18); --fill:rgba(120,120,128,.12); --fill2:rgba(120,120,128,.2);
+  --green:#34C759; --blue:#007AFF; --orange:#FF9500; --red:#FF3B30; --indigo:#5856D6; --teal:#30B0C7; --pink:#FF2D55; --yellow:#FFCC00;
+  --glass-bg:rgba(255,255,255,.58); --glass-rim:rgba(255,255,255,.95); --glass-rim2:rgba(255,255,255,.25);
+  --glass-shadow:0 10px 30px rgba(0,0,0,.10),0 1px 3px rgba(0,0,0,.06);
+  --edge:rgba(236,238,245,.55);
+  --mat:rgba(255,255,255,.5); --mat-strong:rgba(255,255,255,.72);
+  --mat-rim:rgba(255,255,255,1); --mat-rim2:rgba(255,255,255,.35);
+  --mat-shadow:0 1px 2px rgba(30,30,80,.05),0 18px 40px rgba(40,40,110,.12);
+  --pool1:rgba(96,150,255,.55); --pool2:rgba(255,150,190,.42); --pool3:rgba(90,210,190,.42); --pool4:rgba(255,196,120,.38);
+  --text:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --round:ui-rounded,"SF Pro Rounded",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#05060a; --cell:#1C1C1E; --cell2:#2C2C2E;
+    --label:#fff; --label2:rgba(235,235,245,.6); --label3:rgba(235,235,245,.3);
+    --sep:rgba(84,84,88,.6); --fill:rgba(120,120,128,.24); --fill2:rgba(120,120,128,.36);
+    --green:#30D158; --blue:#0A84FF; --orange:#FF9F0A; --red:#FF453A; --indigo:#5E5CE6; --teal:#40C8E0; --pink:#FF375F; --yellow:#FFD60A;
+    --glass-bg:rgba(44,44,48,.55); --glass-rim:rgba(255,255,255,.32); --glass-rim2:rgba(255,255,255,.06);
+    --glass-shadow:0 10px 30px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.4);
+    --edge:rgba(5,6,10,.6);
+    --mat:rgba(62,64,78,.34); --mat-strong:rgba(58,60,74,.62);
+    --mat-rim:rgba(255,255,255,.34); --mat-rim2:rgba(255,255,255,.08);
+    --mat-shadow:0 1px 0 rgba(255,255,255,.04),0 24px 50px rgba(0,0,0,.55);
+    --pool1:rgba(30,110,170,.62); --pool2:rgba(92,70,210,.55); --pool3:rgba(16,150,140,.45); --pool4:rgba(200,120,40,.32);
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#05060a; --cell:#1C1C1E; --cell2:#2C2C2E;
+  --label:#fff; --label2:rgba(235,235,245,.6); --label3:rgba(235,235,245,.3);
+  --sep:rgba(84,84,88,.6); --fill:rgba(120,120,128,.24); --fill2:rgba(120,120,128,.36);
+  --green:#30D158; --blue:#0A84FF; --orange:#FF9F0A; --red:#FF453A; --indigo:#5E5CE6; --teal:#40C8E0; --pink:#FF375F; --yellow:#FFD60A;
+  --glass-bg:rgba(44,44,48,.55); --glass-rim:rgba(255,255,255,.32); --glass-rim2:rgba(255,255,255,.06);
+  --glass-shadow:0 10px 30px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.4);
+  --edge:rgba(5,6,10,.6);
+  --mat:rgba(62,64,78,.34); --mat-strong:rgba(58,60,74,.62);
+  --mat-rim:rgba(255,255,255,.34); --mat-rim2:rgba(255,255,255,.08);
+  --mat-shadow:0 1px 0 rgba(255,255,255,.04),0 24px 50px rgba(0,0,0,.55);
+  --pool1:rgba(30,110,170,.62); --pool2:rgba(92,70,210,.55); --pool3:rgba(16,150,140,.45); --pool4:rgba(200,120,40,.32);
+  color-scheme:dark;
 }
 
 * { box-sizing: border-box; }
@@ -39,13 +52,17 @@ html, body, #root { height: 100%; }
 body {
   margin: 0;
   background: var(--bg);
-  color: var(--text-primary);
-  font-family: var(--font-sans);
+  color: var(--label);
+  font-family: var(--text);
+  font-size: 15px;
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
 }
 
+button { font: inherit; color: inherit; }
+
 ::selection {
-  background: var(--red);
+  background: var(--indigo);
   color: #fff;
 }
 
