@@ -31,7 +31,7 @@ sbdc-system/
     probe_tally_reports.py    ← diagnostic: test Tally report types
     logs/                     ← sync logs (sync_YYYYMMDD_HHMMSS.log)
     last_sync_status.json     ← written after every sync run (overall + per-step status, see below)
-    sync_state.json           ← sales_history rotation/throttle state incl. last_alterid, last_ledger_master_run (not committed — machine-local runtime state)
+    sync_state.json           ← rotation/throttle state incl. last_alterid, last_receipt_alterid, last_ledger_master_run, last_full_sales_history_sweep, last_full_collections_sweep (not committed — machine-local runtime state)
     sync.lock                 ← overlap guard, present only while a sync is running (not committed)
     debug_skipped_vouchers.xml ← Phase 4 debug capture, written when Step 10 skips a voucher with no parseable amount (not committed)
     tally_with_dates.xml      ← local XML backup for --from-local mode
@@ -59,8 +59,12 @@ cd C:\Users\vsome\Desktop\sbdc-system\backend
 #   see "Load-reduction throttles" below for exactly when each one fires.
 python tally_sync_runner.py
 
-# Force a full FY sales_history sweep + deletion reconciliation now:
+# Force a full FY sales_history + daily_collections sweep now:
 python tally_sync_runner.py --full
+
+# One-time fix for daily_collections rows left wrong by the pre-26-Sep-2026
+# late-entered-receipts bug — rebuilds the whole FY, month by month:
+python tally_sync_runner.py --backfill-collections
 
 # Parse local XML backup without Tally connection (outstanding only — Steps 9/9b/10 skipped, can't reach Tally):
 python tally_sync_runner.py --from-local
@@ -321,7 +325,7 @@ Writing to this table is best-effort (wrapped in try/except) — the sync never 
 | 7 | inside reload_supabase | Insert all new outstanding rows |
 | 8 | inside reload_supabase | Delete old rows (previous sync timestamp) |
 | 9 | `sync_today_sales()` | TDL Collection with a server-side date+type+not-cancelled `<FILTER>`, today only, upsert daily_sales. **Always runs** (small, filtered request) |
-| 9b | `sync_today_collections()` | Same approach as Step 9 (`Receipt`/`PoS Receipt`/`Cash Receipt` types), upsert daily_collections. **Always runs** |
+| 9b | `sync_collections()` | AlterID incremental (discovers touched dates, refetches each whole via `sync_today_collections()`) or weekly full sweep — see "Collections (Step 9b)" below. **Always runs**, no throttle |
 | 10 | `sync_sales_history()` | Full FY sweep weekly/`--full`, AlterID incremental once confirmed, month-based fallback otherwise — see below. **Throttled**, mode varies |
 
 Steps 9, 9b, and 10 are **non-fatal** — wrapped in try/except so a Tally timeout doesn't abort the outstanding sync, and each is tracked individually in `sync_status`/`last_sync_status.json` so a degraded run shows as `partial`, not silently as `success`. Step 4.5/4.6 is also non-fatal, tracked under an informational `ledger_master` key that never gates `overall_status` (same as before throttling existed), and is **skipped entirely in `--from-local` mode** (can't reach Tally).
@@ -357,6 +361,23 @@ The office reported Tally lagging on every connected PC — each scheduled run's
 **`ledger_master` step status** is tracked in `sync_status`'s `steps` JSONB (an extra key alongside the four `STATUS_STEPS`) purely for visibility — it does not have its own `last_success_*` column and, matching its pre-throttling behaviour, never gates `overall_status`.
 
 **Run duration is now logged** for every mode (normal sync, backfill) and recorded in `sync_status`/`last_sync_status.json`'s `detail.duration_seconds`, alongside `detail.sales_history_mode` (`"full"`/`"alterid"`/`"fallback"`/`"skipped"`/`None`) — both requested specifically so a degraded/throttled run's actual behaviour is visible without reading the full log.
+
+---
+
+## Collections (Step 9b) — late-entry bug fixed 26-Sep-2026
+
+**The bug**: Step 9b only ever fetched TODAY's receipts. The office batch-enters payments 1-3 days late, so on the day a receipt actually happened, fetching "today" correctly found nothing and `sync_today_collections` upserted a genuine `0` for that date — then when the real receipt got entered days later (dated for the day it actually happened, not the entry day), **nothing ever went back to refetch that past date**, so it stayed stuck at `0` forever. Confirmed live: Tally had 11/22/15 receipts on 22/23/24-Sep, but `daily_collections` showed zero for all three, and the dashboard's old 2-working-day alarm was constantly, wrongly firing on completely ordinary days as a result.
+
+**The fix** mirrors Step 10's AlterID architecture with its own state, `last_receipt_alterid` (sync_state.json) — but the incremental AlterID fetch (`_fetch_receipts_by_alterid`) is used ONLY to discover which **calendar dates** have new/changed receipt activity since last time; it never builds a day's total from the incremental result directly. Each touched date then gets a full, fresh single-day refetch via the existing `sync_today_collections()` — the same function Step 9b always used for "today" — so every touched day's total is always a complete, non-cumulative snapshot. This is what "never double-counted" means: summing incremental deltas onto an existing total would have been fragile; recomputing the whole day from scratch every time it's touched is not.
+
+- **`sync_collections()`** is the Step 9b orchestrator (mirrors `sync_sales_history()`): a weekly full sweep (`_full_collections_sweep`, own independent state key `last_full_collections_sweep` — **deliberately not shared** with Step 10's `last_full_sales_history_sweep`, so collections' sweep can't get silently skipped by racing against sales' sweep updating a shared timestamp first within the same run — confirmed by a real test) or `--full`, otherwise AlterID incremental (`_sync_collections_alterid`) every run, no throttle needed.
+- **If a touched date fails to refetch**, `last_receipt_alterid` is deliberately **not** advanced that run (mode reported as `"partial"`) — advancing it past a date we failed to actually fix would permanently exclude that date from ever being retried, since AlterID only ever increases.
+- **Reset guard**: same pattern as Step 10 — an empty incremental result triggers one independent check (`_fetch_max_receipt_alterid_this_fy`) only when needed, and a lower current max triggers a full FY rebuild (mode `"full-after-alterid-reset"`).
+- **AlterID filtering on Receipt-type vouchers specifically has not been independently probed** the way GST SALES/CC SALES was via `probe_alterid.py` — the mechanism itself (`<FILTER>`/`<SYSTEM TYPE="Formulae">` + `$AlterID`) is the same one already confirmed live and isn't expected to behave differently per voucher type, but this is this codebase's extrapolation, not a separately confirmed fact. Watch the first few real runs' logs.
+
+**`--backfill-collections`** (one-time, run manually): rebuilds `daily_collections` for the whole FY-to-date, month by month (`_full_collections_sweep` — one Tally request per month, not one per day, unlike the older per-day `--backfill`), always overwriting — there's no "skip if already synced" check, since the entire point is correcting rows already known to be wrong. Needs live Tally (checks `check_tally()` up front and exits early with a clear message if unreachable, rather than failing confusingly on every month chunk).
+
+**Frontend**: the old "No payments recorded since `<date>`" alarm notice (fired after just 2 working days) is replaced with an always-shown, calm status line — "Payments entered in Tally up to `<date>`" — that only turns orange once it's genuinely unusual: 4+ working days with nothing new entered (`collectionsStale` in `App.jsx`). Sunday-only-off-day is still the working-day assumption (see `_workingDaysSince`), unchanged from before. Separately, when "Today"'s card shows zero receipts, it now says "Not entered yet. Payments are usually entered a day or two later." instead of "No collections received today" — that specific wording is scoped to the `today` period only; other periods (yesterday/week/month/custom) still say "No collections received `<period>`".
 
 ---
 

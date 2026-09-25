@@ -1449,6 +1449,304 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
     return receipt_count, collections_total
 
 
+# ── Step 9b (continued): AlterID incremental + full-FY rebuild ────────────────
+#
+# 26-Sep-2026: the office batch-enters payments 1-3 days late. Fetching only
+# TODAY's receipts meant a receipt entered on 24-Sep but DATED 22-Sep was
+# never picked up for the 22nd — sync_today_collections upserted a real 0 for
+# the 22nd back when it originally ran (nothing had been entered for that day
+# yet), and nothing ever went back to fix it once the real entry showed up
+# days later. Confirmed live: Tally had 11/22/15 receipts on 22/23/24-Sep,
+# but daily_collections showed zero for all three.
+#
+# Fix mirrors Step 10's AlterID approach exactly, with its own
+# last_receipt_alterid — but the incremental fetch is only ever used to
+# discover WHICH CALENDAR DATES have new/changed receipt activity since last
+# time, never to build a day's total directly from a partial delta. Each
+# touched date gets a full, fresh single-day refetch via the existing
+# sync_today_collections (the same function Step 9b always used), so every
+# day's total is always a complete, non-cumulative snapshot — this is what
+# "never double-counted" means here.
+
+def _fetch_receipts_by_alterid(min_alterid: int) -> "tuple[list, int]":
+    """
+    Fetch receipt vouchers with AlterID > min_alterid. Returns a list of
+    {"sale_date": ...} (only the date is needed — see module note above) plus
+    the max AlterID seen. Raises on request/TDL failure, same as
+    _fetch_sales_by_alterid — the caller's existing per-step try/except in
+    main() treats that as a normal "Step 9b failed this run".
+    """
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in RECEIPT_VOUCHER_TYPES)
+    formula = f'$AlterID > {int(min_alterid)} AND NOT $IsCancelled AND ({type_formula})'
+    xml_body = _build_voucher_collection_request(
+        "CollectionsAlterID",
+        "Date, VoucherNumber, VoucherTypeName, IsCancelled, AlterID",
+        formula,
+    )
+
+    raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
+    _raise_on_tally_error(xml, "CollectionsAlterID")
+
+    records           = []
+    vouchers          = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
+    max_alterid       = min_alterid
+    skipped_cancelled = 0
+
+    for v in vouchers:
+        alterid = _extract_alterid(v)
+        if alterid is not None:
+            max_alterid = max(max_alterid, alterid)
+
+        vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+        if not (vtype_m and "RECEIPT" in vtype_m.group(1).upper()):
+            continue
+        if _is_voucher_cancelled(v):
+            skipped_cancelled += 1
+            continue
+        date_m = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        v_date = _parse_tally_date(date_m.group(1)) if date_m else None
+        if not v_date:
+            continue
+        records.append({"sale_date": v_date.isoformat()})
+
+    if skipped_cancelled:
+        log.info("  Skipped %d cancelled receipt(s)", skipped_cancelled)
+    log.info(
+        "  AlterID > %d: %d raw voucher(s), %d receipt(s) touching dates, max AlterID seen %d",
+        min_alterid, len(vouchers), len(records), max_alterid,
+    )
+    return records, max_alterid
+
+
+def _fetch_max_receipt_alterid_this_fy() -> int:
+    """Same purpose as _fetch_max_sales_alterid_this_fy, for receipts — see that docstring."""
+    fy_start = _fy_start()
+    today    = date.today()
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in RECEIPT_VOUCHER_TYPES)
+    formula = (
+        f'$Date >= $$Date:"{_tally_date_literal(fy_start)}" AND '
+        f'$Date <= $$Date:"{_tally_date_literal(today)}" AND '
+        f'NOT $IsCancelled AND ({type_formula})'
+    )
+    xml_body = _build_voucher_collection_request("CollectionsMaxAlterIDCheck", "VoucherNumber, AlterID", formula)
+    raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
+    _raise_on_tally_error(xml, "CollectionsMaxAlterIDCheck")
+
+    alterids = [_extract_alterid(v) for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)]
+    alterids = [a for a in alterids if a is not None]
+    return max(alterids) if alterids else 0
+
+
+def _full_collections_sweep(dry_run: bool) -> "tuple[int, int]":
+    """
+    Rebuild daily_collections for the whole FY-to-date, month by month (one
+    Tally request per month, not one per day) — every day in range gets its
+    total_amount/invoice_count/items recomputed from a fresh, complete fetch
+    of that month's receipts, so a late-entered or since-deleted/cancelled
+    receipt is always corrected, never left stale. Shared by the weekly
+    automatic sweep, the AlterID reset guard, and the manual
+    --backfill-collections flag. Returns (days_rebuilt, max_alterid_seen).
+    """
+    fy_start = _fy_start()
+    today    = date.today()
+    months   = _fy_months(fy_start, today)
+    log.info("  Collections full sweep: %s → %s, %d month(s)", fy_start, today, len(months))
+
+    all_days = []
+    cur = fy_start
+    while cur <= today:
+        all_days.append(cur.isoformat())
+        cur += timedelta(days=1)
+    by_date = {ds: [] for ds in all_days}
+    max_alterid = 0
+
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in RECEIPT_VOUCHER_TYPES)
+    for (y, m) in months:
+        from_date, to_date = _month_bounds(y, m, today)
+        formula = (
+            f'$Date >= $$Date:"{_tally_date_literal(from_date)}" AND '
+            f'$Date <= $$Date:"{_tally_date_literal(to_date)}" AND '
+            f'NOT $IsCancelled AND ({type_formula})'
+        )
+        xml_body = _build_voucher_collection_request(
+            "CollectionsSweep",
+            "Date, VoucherNumber, PartyLedgerName, Amount, VoucherTypeName, IsCancelled, AlterID",
+            formula,
+        )
+        try:
+            raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+        except requests.exceptions.RequestException as exc:
+            log.warning("  Collections sweep chunk %s-%02d failed (%s) — skipping this month", y, m, exc)
+            continue
+        xml = raw.decode("utf-8", errors="replace")
+        _raise_on_tally_error(xml, f"CollectionsSweep {y}-{m:02d}")
+
+        chunk_count = 0
+        for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL):
+            alterid = _extract_alterid(v)
+            if alterid is not None:
+                max_alterid = max(max_alterid, alterid)
+
+            vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+            if not (vtype_m and "RECEIPT" in vtype_m.group(1).upper()):
+                continue
+            if _is_voucher_cancelled(v):
+                continue
+            date_m = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+            v_date = _parse_tally_date(date_m.group(1)) if date_m else None
+            if not v_date or v_date.isoformat() not in by_date:
+                continue
+
+            ref_m   = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
+            amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+            party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
+            amt = 0.0
+            if amt_m:
+                try:    amt = abs(float(amt_m.group(1)))
+                except ValueError: pass
+            by_date[v_date.isoformat()].append({
+                "customer_name": html.unescape(party_m.group(1).strip()) if party_m else "",
+                "invoice_ref":   ref_m.group(1).strip() if ref_m else "",
+                "amount":        round(amt, 2),
+            })
+            chunk_count += 1
+        log.info("  Collections sweep %s-%02d: %d receipt(s) added", y, m, chunk_count)
+
+    days_with_receipts = sum(1 for items in by_date.values() if items)
+    log.info("  Collections sweep: %d day(s) total, %d with receipts", len(by_date), days_with_receipts)
+
+    if dry_run:
+        log.info("  DRY RUN — daily_collections rebuild skipped")
+        return len(by_date), max_alterid
+
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+    cust_id_map = {}
+    offset = 0
+    while True:
+        batch = supa.table("customers").select("id, customer_name").range(offset, offset + 999).execute().data
+        for row in batch:
+            cust_id_map[row["customer_name"].strip().lower()] = row["id"]
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    rows = []
+    for ds in sorted(by_date):
+        items = by_date[ds]
+        for item in items:
+            item["customer_id"] = cust_id_map.get(item["customer_name"].strip().lower())
+        rows.append({
+            "sale_date":     ds,
+            "total_amount":  round(sum(i["amount"] for i in items), 2),
+            "invoice_count": len(items),
+            "synced_at":     datetime.now(UTC).isoformat(),
+            "items":         items,
+        })
+
+    upserted = 0
+    for i in range(0, len(rows), SUPABASE_BATCH):
+        batch = rows[i:i + SUPABASE_BATCH]
+        supa.table("daily_collections").upsert(batch, on_conflict="sale_date").execute()
+        upserted += len(batch)
+    log.info("  Collections sweep: upserted %d day(s)", upserted)
+
+    return len(rows), max_alterid
+
+
+def _sync_collections_alterid(dry_run: bool) -> "tuple[int, str]":
+    """
+    AlterID incremental Step 9b path — every run, no throttle needed (same
+    reasoning as Step 10's AlterID mode: by construction it only fetches
+    what actually changed). Discovers which calendar dates have new/changed
+    receipt activity, then refetches each of those dates whole via the
+    existing sync_today_collections — see the module note above this
+    section for why that's what makes a day's total always complete instead
+    of an incremental (and potentially double-counted) delta.
+
+    If ANY touched date fails to refetch, last_receipt_alterid is NOT
+    advanced this run — advancing it past receipts on a date we failed to
+    actually fix would permanently exclude that date's fix from ever being
+    retried, since AlterID only ever goes up.
+    """
+    state       = _load_state()
+    min_alterid = state.get("last_receipt_alterid", 0)
+    log.info("Step 9b — AlterID incremental: fetching receipts with AlterID > %d", min_alterid)
+
+    records, max_alterid = _fetch_receipts_by_alterid(min_alterid)
+
+    if not records:
+        # Same reset guard as Step 10's AlterID mode — see that docstring.
+        current_max = _fetch_max_receipt_alterid_this_fy()
+        if current_max < min_alterid:
+            log.warning(
+                "Step 9b — Tally's current max receipt AlterID (%d) is LOWER than our stored value (%d) — "
+                "the sequence went backward (data repaired/restored?). Resetting last_receipt_alterid and "
+                "rebuilding the whole FY's daily_collections instead of trusting the incremental threshold.",
+                current_max, min_alterid,
+            )
+            if not dry_run:
+                state["last_receipt_alterid"] = 0
+                _save_state(state)
+            days_rebuilt, swept_max = _full_collections_sweep(dry_run)
+            if not dry_run:
+                state = _load_state()
+                state["last_receipt_alterid"] = max(state.get("last_receipt_alterid", 0), swept_max)
+                _save_state(state)
+            return days_rebuilt, "full-after-alterid-reset"
+
+    touched_dates = sorted({r["sale_date"] for r in records})
+    all_dates_ok  = True
+    for ds in touched_dates:
+        try:
+            sync_today_collections(dry_run=dry_run, target_date=date.fromisoformat(ds))
+        except Exception as exc:
+            all_dates_ok = False
+            log.warning("  Step 9b — refetching %s failed (%s) — will retry it next run", ds, exc)
+
+    if all_dates_ok:
+        new_max = max(min_alterid, max_alterid)
+        if not dry_run:
+            state["last_receipt_alterid"] = new_max
+            _save_state(state)
+    else:
+        log.warning("  Step 9b — not advancing last_receipt_alterid this run since at least one touched date failed to refetch")
+
+    if touched_dates:
+        log.info(
+            "  Touched %d date(s) with new/changed receipts: %s (%s)",
+            len(touched_dates), touched_dates, "all OK" if all_dates_ok else "SOME FAILED, will retry",
+        )
+    return len(touched_dates), ("alterid" if all_dates_ok else "partial")
+
+
+def sync_collections(dry_run: bool = False, full: bool = False) -> "tuple[int, str]":
+    """
+    Step 9b orchestrator. Weekly full sweep (own independent state key,
+    last_full_collections_sweep — deliberately NOT shared with Step 10's
+    last_full_sales_history_sweep, so collections' sweep can't get silently
+    skipped by racing against sales' sweep updating a shared timestamp
+    first within the same run) or whenever --full is passed; AlterID
+    incremental otherwise.
+    """
+    state          = _load_state()
+    full_sweep_due = full or _is_due(state.get("last_full_collections_sweep"), SALES_HISTORY_FULL_SWEEP_DAYS * 24)
+
+    if full_sweep_due:
+        log.info("Step 9b mode: FULL SWEEP (%s)", "--full" if full else f"{SALES_HISTORY_FULL_SWEEP_DAYS}-day schedule")
+        days_rebuilt, max_alterid = _full_collections_sweep(dry_run)
+        if not dry_run:
+            state = _load_state()
+            state["last_full_collections_sweep"] = datetime.now(UTC).isoformat()
+            state["last_receipt_alterid"] = max(state.get("last_receipt_alterid", 0), max_alterid)
+            _save_state(state)
+        return days_rebuilt, "full"
+
+    log.info("Step 9b mode: AlterID incremental")
+    return _sync_collections_alterid(dry_run)
+
+
 # ── Step 10: Sales Vouchers → sales_history ────────────────────────────────────
 #
 # 25-Sep-2026: re-fetching whole months every run was STILL keeping Tally busy
@@ -2399,6 +2697,33 @@ def backfill_mode(from_date: date, to_date: date, force: bool, dry_run: bool):
     )
 
 
+def backfill_collections_mode(dry_run: bool):
+    """
+    --backfill-collections: one-time manual fix for daily_collections rows
+    written wrong before receipts got their own AlterID incremental sync —
+    Step 9b used to only ever fetch TODAY, so a receipt entered 1-3 days
+    late (the office's normal batch-entry pattern) was never picked up for
+    the date it actually belongs to, leaving that day stuck at a stale/zero
+    total forever. Unlike --backfill, this always overwrites — there's no
+    "skip if already synced" check, since the entire point is correcting
+    rows already known to be wrong — and it's month-chunked (one Tally
+    request per month), not the existing --backfill's one-request-per-day,
+    which would be far too heavy for a whole-FY rebuild.
+    """
+    backfill_start = time.monotonic()
+    log.info("[BACKFILL-COLLECTIONS] Starting full FY rebuild of daily_collections (dry_run=%s)", dry_run)
+    days_rebuilt, max_alterid = _full_collections_sweep(dry_run)
+    if not dry_run:
+        state = _load_state()
+        state["last_receipt_alterid"] = max(state.get("last_receipt_alterid", 0), max_alterid)
+        state["last_full_collections_sweep"] = datetime.now(UTC).isoformat()
+        _save_state(state)
+    log.info(
+        "[BACKFILL-COLLECTIONS] Finished in %.1fs — %d day(s) rebuilt",
+        time.monotonic() - backfill_start, days_rebuilt,
+    )
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2410,6 +2735,7 @@ def main():
     parser.add_argument("--from",       dest="from_date", metavar="YYYY-MM-DD", help="Backfill start date (inclusive)")
     parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
     parser.add_argument("--force",      action="store_true", help="Overwrite existing rows in --backfill mode")
+    parser.add_argument("--backfill-collections", action="store_true", help="Rebuild daily_collections for the whole FY from Tally, month by month — one-time fix for late-entered receipts never being refetched")
     args = parser.parse_args()
 
     dry_run    = args.dry_run
@@ -2445,6 +2771,25 @@ def main():
                 backfill_mode(from_date, to_date, force=args.force, dry_run=dry_run)
             except Exception as exc:
                 log.exception("BACKFILL FAILED: %s", exc)
+                sys.exit(1)
+            return
+
+        # ── Backfill collections mode ────────────────────────────────────────
+        if args.backfill_collections:
+            log.info("=" * 60)
+            log.info("SUPREME BALAJI — BACKFILL COLLECTIONS MODE")
+            if dry_run: log.info("  DRY RUN — no DB writes")
+            log.info("  Run   : %s", RUN_TS)
+            log.info("=" * 60)
+
+            if not check_tally():
+                log.error("Tally not reachable — cannot backfill collections without live Tally.")
+                sys.exit(1)
+
+            try:
+                backfill_collections_mode(dry_run=dry_run)
+            except Exception as exc:
+                log.exception("BACKFILL-COLLECTIONS FAILED: %s", exc)
                 sys.exit(1)
             return
 
@@ -2557,6 +2902,7 @@ def main():
                 _send_skip_alert_email(unmatched)
 
             step9_count, step9_total, step10_today, step10_mode = 0, 0.0, None, None
+            collections_mode = None
             if not from_local:
                 try:
                     step9_count, step9_total = sync_today_sales(dry_run=dry_run)
@@ -2566,7 +2912,7 @@ def main():
                     step_status["today_sales"] = "failed"
 
                 try:
-                    sync_today_collections(dry_run=dry_run)
+                    _touched, collections_mode = sync_collections(dry_run=dry_run, full=args.full)
                     step_status["collections"] = "success"
                 except Exception as exc:
                     log.warning("Step 9b WARNING — Today's collections sync failed (non-fatal): %s", exc)
@@ -2620,6 +2966,7 @@ def main():
                 ],
                 "reconcile_status":    reconcile_status,
                 "sales_history_mode":  step10_mode,
+                "collections_mode":    collections_mode,
                 "duration_seconds":    round(elapsed_s, 1),
             }
             _write_status(overall_status, step_status, summary, dry_run=dry_run)
@@ -2636,6 +2983,8 @@ def main():
                 log.info("  Skipped (no match)     : %d", skipped)
             else:
                 log.info("  Outstanding (Step 2/3) : SKIPPED this run (throttled)")
+            if collections_mode:
+                log.info("  Collections mode       : %s", collections_mode)
             if step10_mode:
                 log.info("  Sales history mode     : %s", step10_mode)
             log.info("  Step status            : %s", step_status)

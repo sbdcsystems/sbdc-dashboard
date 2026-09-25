@@ -802,9 +802,15 @@ export default function App() {
     : null
   const cdRating        = custDetail ? computeRating(cdBills, cdHistory, fyMedian, FY_MONTHS_ELAPSED) : null
 
-  // ── "No payments" notice — 2+ working days since the last real receipt ─────
+  // ── Collections status line — calm by default, orange only if stale ────────
+  // Was an alarm-style "No payments recorded since <date>" notice that fired
+  // after just 2 working days — but the office normally batch-enters
+  // payments 1-3 days late, so it was permanently, wrongly alarming on
+  // completely ordinary days. Now always shows the plain fact (latest date
+  // Tally has entries for) and only escalates to orange once it's genuinely
+  // unusual: 4+ working days with nothing new entered.
   const workingDaysSinceLastPayment = lastCollectionDate ? _workingDaysSince(lastCollectionDate, TODAY) : null
-  const showNoPaymentsNotice = workingDaysSinceLastPayment !== null && workingDaysSinceLastPayment >= 2
+  const collectionsStale = workingDaysSinceLastPayment !== null && workingDaysSinceLastPayment >= 4
 
   // ── "Last synced" header pill ───────────────────────────────────────────────
   const lastSyncStale = lastSync
@@ -981,7 +987,9 @@ export default function App() {
                     {collDisplayData ? (
                       collDisplayData.invoice_count === 0 ? (
                         <p className="msub" style={{ marginTop: 12 }}>
-                          {collCardPeriod === 'today' ? 'No collections received today' : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
+                          {collCardPeriod === 'today'
+                            ? 'Not entered yet. Payments are usually entered a day or two later.'
+                            : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
                         </p>
                       ) : (
                         <>
@@ -1025,15 +1033,15 @@ export default function App() {
                 )}
               </section>
 
-              {/* No-payments notice */}
-              {showNoPaymentsNotice && (
-                <div className="notice">
-                  <div className="ic"><Icon.warn /></div>
-                  <div>
-                    <b>No payments recorded since {new Date(lastCollectionDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</b>
-                    <span>If customers have paid, the receipts still need to be entered in Tally.</span>
-                  </div>
-                </div>
+              {/* Collections status — calm by default; the office normally batch-enters
+                  payments 1-3 days late, so this must not read as an alarm on an
+                  ordinary day. Only turns orange once it's genuinely unusual. */}
+              {lastCollectionDate && (
+                <p className="sf" style={{ padding: '0 2px', color: collectionsStale ? 'var(--orange)' : undefined }}>
+                  Payments entered in Tally up to{' '}
+                  {new Date(lastCollectionDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
+                  {collectionsStale && ' — nothing new in a while, worth checking'}
+                </p>
               )}
 
               {/* By staff */}
