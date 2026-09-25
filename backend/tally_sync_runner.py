@@ -124,12 +124,13 @@ FALLBACK_OLDER_MONTH_HOURS   = 24    # one rotating older month — at most this
 # Tally's AlterID increases company-wide whenever any object is created or
 # edited — filtering by it is the standard way to fetch only what changed
 # since last time, including edits/cancellations to old invoices, with no
-# date bound needed at all. Confirmed live on this Tally install: date
-# filters via <FILTER>/<SYSTEM TYPE="Formulae"> (see CLAUDE.md). AlterID
-# filtering itself is NOT yet confirmed — flip this to True only after
-# running backend/probe_alterid.py on the office PC and confirming it
-# returns sane results. Until then, Step 10 uses the month-based fallback.
-ALTERID_SYNC_ENABLED = False
+# date bound needed at all. Confirmed live via backend/probe_alterid.py on
+# the office PC, 25-Sep-2026: max AlterID 174542, and AlterID > 174492
+# correctly returned 9 real recent vouchers (GST SALES + CC SALES, all that
+# day) in 3.5s vs 9.2s for the equivalent full-FY scan. See
+# _sync_sales_history_alterid for the guard against the sequence ever going
+# backward (a Tally data repair/restore).
+ALTERID_SYNC_ENABLED = True
 
 # ── Phase 1 incremental sales_history state ────────────────────────────────────
 STATE_FILE            = BASE_DIR / "sync_state.json"
@@ -1974,19 +1975,77 @@ def _full_sales_history_sweep(dry_run: bool) -> "tuple[float, int]":
     return today_total, max_alterid
 
 
+def _fetch_max_sales_alterid_this_fy() -> int:
+    """
+    Independent check of Tally's actual current max sales-voucher AlterID for
+    the FY to date — scoped exactly like probe_alterid.py's own "find the
+    max" step (confirmed ~9.2s live), since that's the one already proven to
+    work on this install. Meaningfully heavier than the ordinary incremental
+    fetch, so this is only called as a fallback check (see
+    _sync_sales_history_alterid), never on every run.
+    """
+    fy_start = _fy_start()
+    today    = date.today()
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
+    formula = (
+        f'$Date >= $$Date:"{_tally_date_literal(fy_start)}" AND '
+        f'$Date <= $$Date:"{_tally_date_literal(today)}" AND '
+        f'NOT $IsCancelled AND ({type_formula})'
+    )
+    xml_body = _build_voucher_collection_request("SalesMaxAlterIDCheck", "VoucherNumber, AlterID", formula)
+    raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
+    _raise_on_tally_error(xml, "SalesMaxAlterIDCheck")
+
+    alterids = [_extract_alterid(v) for v in re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)]
+    alterids = [a for a in alterids if a is not None]
+    return max(alterids) if alterids else 0
+
+
 def _sync_sales_history_alterid(dry_run: bool) -> "tuple[float, int, str]":
     """
     AlterID incremental Step 10 path — every run, no throttle needed, since
     by construction it only ever fetches what actually changed since the
     last seen AlterID. Only reached when ALTERID_SYNC_ENABLED is True.
+
+    Safety guard: an empty result is ambiguous on its own — it could mean
+    genuinely nothing changed, or it could mean Tally's AlterID sequence
+    went backward (a data repair/restore), which would leave our stored
+    threshold permanently above everything that currently exists and
+    silently blind every future incremental fetch too. Only on that empty
+    result does this pay for one heavier independent check
+    (_fetch_max_sales_alterid_this_fy) to tell the two apart; a normal run
+    that finds new vouchers never pays that cost. If the sequence really did
+    go backward, this resets last_alterid and runs a full FY sweep instead
+    of trusting the stale threshold — the weekly full sweep would eventually
+    catch this too, but not for up to SALES_HISTORY_FULL_SWEEP_DAYS.
     """
     state       = _load_state()
     min_alterid = state.get("last_alterid", 0)
     log.info("Step 10 — AlterID incremental: fetching sales vouchers with AlterID > %d", min_alterid)
 
-    skip_examples       = []
-    records, max_alterid = _fetch_sales_by_alterid(min_alterid, skip_examples)
+    skip_examples         = []
+    records, max_alterid  = _fetch_sales_by_alterid(min_alterid, skip_examples)
     _write_skip_examples_debug_file(skip_examples)
+
+    if not records:
+        current_max = _fetch_max_sales_alterid_this_fy()
+        if current_max < min_alterid:
+            log.warning(
+                "Step 10 — Tally's current max sales AlterID (%d) is LOWER than our stored value (%d) — "
+                "the sequence went backward (data repaired/restored?). Resetting last_alterid and running "
+                "a full FY sweep instead of trusting the incremental threshold.",
+                current_max, min_alterid,
+            )
+            if not dry_run:
+                state["last_alterid"] = 0
+                _save_state(state)
+            today_total, swept_max = _full_sales_history_sweep(dry_run)
+            if not dry_run:
+                state = _load_state()
+                state["last_alterid"] = max(state.get("last_alterid", 0), swept_max)
+                _save_state(state)
+            return today_total, swept_max, "full-after-alterid-reset"
 
     new_max = max(min_alterid, max_alterid)
     if not dry_run:
