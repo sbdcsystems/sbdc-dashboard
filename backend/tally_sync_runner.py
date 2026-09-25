@@ -1416,24 +1416,40 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
     row per ledger entry, ambiguous for multi-ledger receipts). Upserts to
     daily_collections. Caller should catch exceptions (non-fatal); see the
     note on sync_today_sales about never treating an exception as a real zero.
+
+    26-Sep-2026: total_amount/invoice_count only count receipts whose party
+    resolved to a real customer_id — see "Collections must exclude
+    non-customer parties" below. Non-customer items (a bank ledger like
+    "Axis Bank - PoS A/c", a related-party loan ledger, etc.) are still kept
+    in `items`, marked `"excluded": True`, so they stay visible rather than
+    silently vanishing.
     """
     today = target_date or date.today()
     log.info("Step 9b — Fetching collections for %s (TDL Collection)", today.isoformat())
 
-    items         = _fetch_vouchers_for_day(today, "receipt", "TodayCollections")
-    receipt_count = len(items)
-    collections_total = round(sum(i["amount"] for i in items), 2)
+    items = _fetch_vouchers_for_day(today, "receipt", "TodayCollections")
 
-    log.info("  Today's collections: %d receipt(s), Rs %s", receipt_count, f"{collections_total:,.2f}")
+    # Customer-ID resolution is a read, not a write — do it before the
+    # dry_run branch so dry-run logging reports the same real total a live
+    # run would, instead of the old (wrong) sum-of-everything figure.
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+    matched = _resolve_customer_ids(supa, items)
+    for item in items:
+        item["excluded"] = not bool(item.get("customer_id"))
+    excluded_items = [i for i in items if i["excluded"]]
+    counted_items  = [i for i in items if not i["excluded"]]
+
+    receipt_count      = len(counted_items)
+    collections_total  = round(sum(i["amount"] for i in counted_items), 2)
+
+    log.info(
+        "  Today's collections: %d receipt(s) counted, Rs %s (%d unmatched/%d excluded as non-customer)",
+        receipt_count, f"{collections_total:,.2f}", len(items) - matched, len(excluded_items),
+    )
 
     if dry_run:
         log.info("  DRY RUN — daily_collections upsert skipped")
         return receipt_count, collections_total
-
-    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
-
-    matched = _resolve_customer_ids(supa, items)
-    log.info("  UUID resolved: %d / %d items (%d unmatched)", matched, len(items), len(items) - matched)
 
     supa.table("daily_collections").upsert(
         {
@@ -1617,10 +1633,10 @@ def _full_collections_sweep(dry_run: bool) -> "tuple[int, int]":
     days_with_receipts = sum(1 for items in by_date.values() if items)
     log.info("  Collections sweep: %d day(s) total, %d with receipts", len(by_date), days_with_receipts)
 
-    if dry_run:
-        log.info("  DRY RUN — daily_collections rebuild skipped")
-        return len(by_date), max_alterid
-
+    # Customer-ID resolution is a read, not a write — do it (and compute the
+    # real, customer-only totals) before the dry_run branch, so a dry run
+    # reports the same numbers a live run would write, not the old
+    # sum-of-everything figure that included bank/loan-ledger "receipts".
     supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
     cust_id_map = {}
     offset = 0
@@ -1632,18 +1648,43 @@ def _full_collections_sweep(dry_run: bool) -> "tuple[int, int]":
             break
         offset += 1000
 
+    # 26-Sep-2026: totals must only count receipts whose party is a real
+    # customer — confirmed live examples of non-customer parties turning up
+    # as receipt "parties": a bank ledger recorded twice under different
+    # voucher series for the same card settlement ("Axis Bank - PoS A/c"),
+    # a related-party loan ledger ("Flying Colourss - Purchase"), and a bank
+    # account ledger. Excluded items are kept in `items` (marked
+    # "excluded": True) rather than dropped, so they stay visible.
+    excluded_by_name: dict = {}
     rows = []
     for ds in sorted(by_date):
         items = by_date[ds]
         for item in items:
             item["customer_id"] = cust_id_map.get(item["customer_name"].strip().lower())
+            item["excluded"]    = not bool(item["customer_id"])
+            if item["excluded"]:
+                agg = excluded_by_name.setdefault(item["customer_name"], {"total": 0.0, "count": 0})
+                agg["total"] += item["amount"]
+                agg["count"] += 1
+        counted = [i for i in items if not i["excluded"]]
         rows.append({
             "sale_date":     ds,
-            "total_amount":  round(sum(i["amount"] for i in items), 2),
-            "invoice_count": len(items),
+            "total_amount":  round(sum(i["amount"] for i in counted), 2),
+            "invoice_count": len(counted),
             "synced_at":     datetime.now(UTC).isoformat(),
             "items":         items,
         })
+
+    if excluded_by_name:
+        log.info("  Excluded non-customer parties over this sweep's range (%d distinct):", len(excluded_by_name))
+        for name, agg in sorted(excluded_by_name.items(), key=lambda kv: -kv[1]["total"]):
+            log.info("    %-45s  Rs %14s  (%d receipt(s))", name, f"{agg['total']:,.2f}", agg["count"])
+    else:
+        log.info("  No non-customer parties found in this sweep's range")
+
+    if dry_run:
+        log.info("  DRY RUN — daily_collections rebuild skipped")
+        return len(by_date), max_alterid
 
     upserted = 0
     for i in range(0, len(rows), SUPABASE_BATCH):

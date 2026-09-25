@@ -379,6 +379,22 @@ The office reported Tally lagging on every connected PC — each scheduled run's
 
 **Frontend**: the old "No payments recorded since `<date>`" alarm notice (fired after just 2 working days) is replaced with an always-shown, calm status line — "Payments entered in Tally up to `<date>`" — that only turns orange once it's genuinely unusual: 4+ working days with nothing new entered (`collectionsStale` in `App.jsx`). Sunday-only-off-day is still the working-day assumption (see `_workingDaysSince`), unchanged from before. Separately, when "Today"'s card shows zero receipts, it now says "Not entered yet. Payments are usually entered a day or two later." instead of "No collections received today" — that specific wording is scoped to the `today` period only; other periods (yesterday/week/month/custom) still say "No collections received `<period>`".
 
+### Non-customer parties excluded from collections totals (26-Sep-2026)
+
+**The bug**: `daily_collections.total_amount` counted every receipt regardless of who the party was. Live data showed non-customer ledgers being counted as collections — most visibly "Axis Bank - PoS A/c" appearing **twice** per day with identical amounts under different voucher series (e.g. ₹1,598 as both ref `1359` and ref `132` on 15-Sep) — almost certainly the same card settlement recorded once in the `Receipt` series and once in `PoS Receipt`.
+
+**The fix**: `sync_today_collections()` and `_full_collections_sweep()` now resolve `customer_id` *before* computing totals (moved ahead of the `dry_run` branch, since resolution is a read — a dry run must report the same corrected total a live run would write, not the old sum-of-everything). `total_amount`/`invoice_count` only count items with a real (non-null) `customer_id`; everything else stays in `items` marked `"excluded": true` rather than being dropped, so it's still visible. `_full_collections_sweep` also logs every distinct excluded party name with its total and count over the sweep's range, specifically so this can be sanity-checked against real customer names before trusting it.
+
+**Impact confirmed against live (already-Tally-matching) data, 15–24 Sep 2026**: stored totals for that window summed to ₹69,95,446; with the fix, ₹67,46,800 — ₹2,48,646 excluded. Two of ten days (21st, 22nd) had zero exclusions.
+
+**Open questions — decided 26-Sep-2026, revisit if circumstances change:**
+
+- **`Axis Bank - PoS A/c`** (₹47,75,837 FY-to-date, 279 receipts, 02-Apr to 24-Sep) and **`Axis Bank - 911030013645180`** (₹5,08,825, 11 receipts) — kept excluded for now. **Pending**: office to confirm whether the paired `Axis Bank - PoS A/c` entries are card payments from walk-in/cash customers (they appear in matched pairs, suggesting the same settlement recorded under two voucher series). If confirmed, these should be counted **once**, not zero times — this needs a real fix once confirmed, not just leaving them excluded forever.
+- **`Sree Kumaran Silks (G.Natarajan)`** (₹68,608, 10 receipts, 08-Apr to 14-May) — kept excluded, **no fuzzy matching added**. `customers` has `Sree Kumaran Silks (G.Nataraj)` (one letter short) but not this exact name — very likely the same real customer under a duplicate/misspelled ledger in Tally. Decision: the office will merge the duplicate ledger in Tally directly rather than paper over it with fuzzy name matching in code (fuzzy matching here risks silently mis-attributing a receipt to the *wrong* similarly-named customer, which is worse than under-counting).
+- **`B.Nagappa Dye Chem`** (₹1,019, 1 receipt) and **`Lock & Key`** (₹1,653, 2 receipts) — kept excluded. No similar name exists in `customers` at all; too small and ambiguous (a never-onboarded small customer vs. a genuine vendor/service payment) to resolve without more office input.
+
+If any of the above gets resolved (ledger ownership confirmed, Tally ledgers merged, a customer added), re-run `--backfill-collections` afterward to pick it up — the exclusion list isn't hardcoded anywhere, it's purely "does `customer_id` resolve", so fixing the underlying data in Tally or `customers` is enough.
+
 ---
 
 ## Tally group → staff assignment mapping
