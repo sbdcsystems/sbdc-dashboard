@@ -106,6 +106,31 @@ XML_KEEP_DAYS       = 7     # delete XML backups older than this
 SUPABASE_BATCH      = 200   # records per insert call
 SANITY_DROP_LIMIT   = 0.50  # abort if new bill count < 50% of current DB count
 
+# ── Load-reduction throttles ─────────────────────────────────────────────────────
+# 25-Sep-2026: office reported Tally lagging on every connected PC — each
+# scheduled run's heavy steps kept the shared billing PC busy 80-120s every
+# 30 minutes. Steps 1/9/9b stay light and run every time (small, filtered
+# requests already); everything below now reuses previous data instead of
+# refetching it, gated by how long it's actually been since it last ran.
+OUTSTANDING_THROTTLE_HOURS        = 3     # Step 2/3 (Bills Receivable) — only if older than this
+LEDGER_MASTER_THROTTLE_HOURS      = 24    # Step 4.5/4.6 (ledger master) — at most once a day
+SALES_HISTORY_FULL_SWEEP_DAYS     = 7     # Step 10 — full FY + deletion reconciliation, at most weekly
+SALES_HISTORY_DELETE_SANITY_LIMIT = 0.20  # abort deletion reconciliation if it would remove > this fraction of tracked vouchers
+
+# Step 10 fallback cadence — used only while ALTERID_SYNC_ENABLED is False.
+FALLBACK_CURRENT_MONTH_HOURS = 2     # current month — at most this often
+FALLBACK_OLDER_MONTH_HOURS   = 24    # one rotating older month — at most this often
+
+# Tally's AlterID increases company-wide whenever any object is created or
+# edited — filtering by it is the standard way to fetch only what changed
+# since last time, including edits/cancellations to old invoices, with no
+# date bound needed at all. Confirmed live on this Tally install: date
+# filters via <FILTER>/<SYSTEM TYPE="Formulae"> (see CLAUDE.md). AlterID
+# filtering itself is NOT yet confirmed — flip this to True only after
+# running backend/probe_alterid.py on the office PC and confirming it
+# returns sane results. Until then, Step 10 uses the month-based fallback.
+ALTERID_SYNC_ENABLED = False
+
 # ── Phase 1 incremental sales_history state ────────────────────────────────────
 STATE_FILE            = BASE_DIR / "sync_state.json"
 NEW_MONTH_CATCHUP_RUNS = 6   # re-fetch previous month for this many runs after a month rolls over
@@ -249,6 +274,45 @@ def _save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+# ── Throttle helpers (load-reduction) ─────────────────────────────────────────
+
+def _hours_since(iso_str: "str | None") -> "float | None":
+    """
+    Hours elapsed since an ISO timestamp. Returns None if iso_str is falsy or
+    unparseable — callers treat that as "infinitely overdue" (never run yet,
+    or the record is corrupt, both mean "go ahead and run it"). A naive
+    (offset-less) timestamp is treated as UTC rather than rejected, since
+    RUN_TS-style local strings can still show up in older state.
+    """
+    if not iso_str:
+        return None
+    try:
+        then = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - then).total_seconds() / 3600
+
+
+def _is_due(iso_str: "str | None", hours: float) -> bool:
+    """True if iso_str is missing/unparseable, or at least `hours` old."""
+    elapsed = _hours_since(iso_str)
+    return elapsed is None or elapsed >= hours
+
+
+def _load_last_status() -> dict:
+    """Read last_sync_status.json — used both to write it (carry last_success
+    forward) and to decide whether a throttled step is due."""
+    status_path = BASE_DIR / "last_sync_status.json"
+    if status_path.exists():
+        try:
+            return json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("  Could not parse %s (%s)", status_path.name, exc)
+    return {}
+
+
 # ── Overlap lock ─────────────────────────────────────────────────────────────────
 
 def _pid_running(pid: int) -> bool:
@@ -389,12 +453,7 @@ def _write_status(status: str, steps: dict, detail: "dict | None" = None, dry_ru
     detail = detail or {}
 
     status_path = BASE_DIR / "last_sync_status.json"
-    prev = {}
-    if status_path.exists():
-        try:
-            prev = json.loads(status_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            log.warning("  Could not parse previous %s (%s) — last_success history reset", status_path.name, exc)
+    prev = _load_last_status()
 
     # BUG FIX: this used to be datetime.now().isoformat() — a naive local
     # (IST, on the office PC) timestamp with no offset in the string.
@@ -410,7 +469,12 @@ def _write_status(status: str, steps: dict, detail: "dict | None" = None, dry_ru
     now_local_iso = datetime.now().isoformat()
     last_success  = dict(prev.get("last_success", {}))
     for step in STATUS_STEPS:
-        if steps.get(step) == "success":
+        # dry_run guard: a dry run doesn't actually write anything to that
+        # step's target table, so it must never count as a "last success" —
+        # that value now also drives the Step 2/3 throttle in main(), and a
+        # dry-run test would otherwise silently suppress the next real
+        # outstanding sync for OUTSTANDING_THROTTLE_HOURS.
+        if steps.get(step) == "success" and not dry_run:
             last_success[step] = now_utc_iso
 
     payload = {
@@ -1384,18 +1448,30 @@ def sync_today_collections(dry_run: bool = False, target_date: "date | None" = N
     return receipt_count, collections_total
 
 
-# ── Step 10: Sales Vouchers → sales_history (incremental) ─────────────────────
+# ── Step 10: Sales Vouchers → sales_history ────────────────────────────────────
 #
-# Re-fetching the whole FY every 30 minutes is what was overloading Tally: the
-# April chunk alone was 14,161 raw voucher tags and took 60s, and by the time
-# the loop reached June the PC had degraded to connection resets and then
-# outright refused connections. A scheduled run now fetches only the CURRENT
-# month plus one older FY month chosen in rotation (state kept in
-# sync_state.json), so full FY coverage happens gradually across the ~18 runs
-# a day instead of every single run. `--full` still does the complete sweep
-# for a manual refresh. Upserts are keyed on voucher_number and this step
-# never deletes, so a partial/incremental fetch can never lose data — it can
-# only be behind on the months it hasn't gotten to yet this cycle.
+# 25-Sep-2026: re-fetching whole months every run was STILL keeping Tally busy
+# 80-120s every 30 minutes even after the Phase 1 current+rotation scheme —
+# the office reported it lagging every connected PC on the shared billing
+# machine. Step 10 now has three modes:
+#
+#   - Full FY sweep — every SALES_HISTORY_FULL_SWEEP_DAYS, or whenever --full
+#     is passed. The only mode that can detect deletions (an incremental
+#     fetch, by date range OR AlterID, can only ever add/update — it has no
+#     way to notice a voucher that's gone missing).
+#   - AlterID incremental — once ALTERID_SYNC_ENABLED is confirmed True,
+#     every run fetches only sales vouchers with Tally's AlterID greater than
+#     the highest one seen last time. AlterID increases company-wide on
+#     every create/edit, so this needs no date bound at all and picks up
+#     edits/cancellations to old invoices for free, not just new invoices.
+#   - Month-based fallback — used while ALTERID_SYNC_ENABLED is False. Same
+#     current+rotation idea as before, but now rate-limited (current month at
+#     most every FALLBACK_CURRENT_MONTH_HOURS, one older month at most every
+#     FALLBACK_OLDER_MONTH_HOURS) instead of refetching both every single run.
+#
+# Upserts are always keyed on voucher_number; only the full sweep ever
+# deletes, and only under the safety checks in
+# _reconcile_sales_history_deletions.
 
 def _fy_months(fy_start: date, today: date) -> list:
     """List of (year, month) tuples from fy_start's month through today's month, inclusive."""
@@ -1467,12 +1543,24 @@ def _parse_rate(raw: str):
     except: return None  # noqa: E722
 
 
-def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: list) -> list:
+def _extract_alterid(voucher_xml: str) -> "int | None":
+    m = re.search(r"<ALTERID[^>]*>(.*?)</ALTERID>", voucher_xml)
+    if not m:
+        return None
+    try:
+        return int(float(m.group(1).strip()))
+    except ValueError:
+        return None
+
+
+def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: list) -> dict:
     """
-    Fetch + parse one month's Sales vouchers from Tally. Returns a list of
-    record dicts (possibly empty). Never raises for a single bad chunk — a
-    timeout or connection failure on one month must not abort the months
-    still queued behind it, so this logs a warning and returns [] instead.
+    Fetch + parse one month's Sales vouchers from Tally. Returns
+    {"records": [...], "max_alterid": int, "ok": bool} — "ok" is False only
+    when the request itself failed (timeout/connection error), so the caller
+    can tell "genuinely zero vouchers this month" apart from "couldn't ask".
+    A single bad chunk never raises — a timeout on one month must not abort
+    the months still queued behind it.
 
     Confirmed live 24-Sep-2026: "no parseable amount tag" skips were all
     cancelled vouchers (IsCancelled=Yes, with empty party/amount/entries) —
@@ -1498,7 +1586,7 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
     )
     xml_body = _build_voucher_collection_request(
         "SalesHistory",
-        "Date, VoucherNumber, PartyLedgerName, Amount, VoucherTypeName, IsCancelled, StockItemName, ActualQty, Rate",
+        "Date, VoucherNumber, PartyLedgerName, Amount, VoucherTypeName, IsCancelled, StockItemName, ActualQty, Rate, AlterID",
         formula,
     )
 
@@ -1509,7 +1597,7 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
         # version only caught Timeout, so a mid-loop ConnectionResetError would
         # propagate out and abandon every month still queued behind it.
         log.warning("  Chunk %s–%s failed (%s) — skipping this month, will retry next rotation", from_str, to_str, exc)
-        return []
+        return {"records": [], "max_alterid": 0, "ok": False}
 
     xml = raw.decode("utf-8", errors="replace")
     _raise_on_tally_error(xml, f"SalesHistory chunk {from_str}-{to_str}")
@@ -1521,6 +1609,7 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
     after_so          = 0
     skipped_cancelled = 0
     dates_seen        = []
+    max_alterid       = 0
     synced_at         = datetime.now(UTC).isoformat()
 
     for v in vouchers:
@@ -1528,6 +1617,10 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
         v_date  = _parse_tally_date(date_m.group(1)) if date_m else None
         if v_date:
             dates_seen.append(v_date)
+
+        alterid = _extract_alterid(v)
+        if alterid is not None:
+            max_alterid = max(max_alterid, alterid)
 
         vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
         if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
@@ -1579,81 +1672,105 @@ def _fetch_sales_month_chunk(year: int, month: int, today: date, skip_examples: 
         "  Chunk: %d raw VOUCHER tags | %d after SALES filter | %d after SO- filter | %d added",
         raw_count, after_sales, after_so, len(records),
     )
-    return records
+    return {"records": records, "max_alterid": max_alterid, "ok": True}
 
 
-def _pick_incremental_months(fy_start: date, today: date) -> list:
+def _fetch_sales_by_alterid(min_alterid: int, skip_examples: list) -> "tuple[list, int]":
     """
-    Decide which (year, month) chunks a scheduled run should fetch: the
-    current month always; the previous month too for the first
-    NEW_MONTH_CATCHUP_RUNS runs after a month rollover (catches late entries);
-    and one older FY month chosen in rotation so the full FY gets covered
-    gradually across a day's worth of runs. Persists rotation state to
-    STATE_FILE — caller decides whether to actually save (skipped in dry-run).
+    Fetch sales vouchers with AlterID > min_alterid — no date bound needed at
+    all, since AlterID tracks "what changed", not "what date it's dated for".
+    This is what picks up an edit or cancellation to an old invoice: it keeps
+    whatever AlterID it's given on the edit, so it always ends up in the next
+    incremental fetch, whereas a date-range fetch would never look at that
+    month again once its rotation had passed. Only used once
+    ALTERID_SYNC_ENABLED is confirmed True (see its docstring). Returns
+    (records, max_alterid_seen). Raises on request/TDL failure — the caller
+    (sync_sales_history, via main()'s existing per-step try/except) treats
+    that as a normal "Step 10 failed this run", same as any other Tally call.
     """
-    all_months   = _fy_months(fy_start, today)
-    current      = (today.year, today.month)
-    month_key    = f"{today.year:04d}-{today.month:02d}"
+    type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
+    formula = f'$AlterID > {int(min_alterid)} AND NOT $IsCancelled AND ({type_formula})'
+    xml_body = _build_voucher_collection_request(
+        "SalesHistoryAlterID",
+        "Date, VoucherNumber, PartyLedgerName, Amount, VoucherTypeName, IsCancelled, StockItemName, ActualQty, Rate, AlterID",
+        formula,
+    )
 
-    state = _load_state()
-    if state.get("last_seen_month") != month_key:
-        state["last_seen_month"]     = month_key
-        state["new_month_runs_done"] = 0
+    raw = _tally_post(xml_body, timeout=TALLY_COLLECTION_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
+    _raise_on_tally_error(xml, "SalesHistoryAlterID")
 
-    months = [current]
+    records           = []
+    vouchers          = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
+    max_alterid       = min_alterid
+    skipped_cancelled = 0
+    synced_at         = datetime.now(UTC).isoformat()
 
-    prev_month = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
-    if prev_month in all_months and prev_month != current:
-        if state.get("new_month_runs_done", 0) < NEW_MONTH_CATCHUP_RUNS:
-            months.append(prev_month)
-            state["new_month_runs_done"] = state.get("new_month_runs_done", 0) + 1
+    for v in vouchers:
+        alterid = _extract_alterid(v)
+        if alterid is not None:
+            max_alterid = max(max_alterid, alterid)
 
-    older = [m for m in all_months if m not in months]
-    if older:
-        idx = state.get("rotation_index", 0) % len(older)
-        months.append(older[idx])
-        state["rotation_index"] = state.get("rotation_index", 0) + 1
+        vtype_m = re.search(r"<VOUCHERTYPENAME[^>]*>(.*?)</VOUCHERTYPENAME>", v)
+        if not (vtype_m and "SALES" in vtype_m.group(1).upper()):
+            continue
+        ref_m = re.search(r"<VOUCHERNUMBER[^>]*>(.*?)</VOUCHERNUMBER>", v)
+        ref   = ref_m.group(1).strip() if ref_m else None
+        if not ref or ref.startswith("SO-"):
+            continue
 
-    return months, state
+        if _is_voucher_cancelled(v):
+            skipped_cancelled += 1
+            continue
+
+        date_m  = re.search(r"<DATE[^>]*>(.*?)</DATE>", v)
+        v_date  = _parse_tally_date(date_m.group(1)) if date_m else None
+        party_m = re.search(r"<PARTYLEDGERNAME[^>]*>(.*?)</PARTYLEDGERNAME>", v)
+        amt_m   = re.search(r"<AMOUNT[^>]*>(.*?)</AMOUNT>", v)
+        stock_m = re.search(r"<STOCKITEMNAME[^>]*>(.*?)</STOCKITEMNAME>", v)
+        qty_m   = re.search(r"<ACTUALQTY[^>]*>(.*?)</ACTUALQTY>", v)
+        rate_m  = re.search(r"<RATE[^>]*>(.*?)</RATE>", v)
+
+        amount = None
+        if amt_m:
+            try:    amount = round(abs(float(amt_m.group(1))), 2)
+            except: pass  # noqa: E722
+        if amount is None:
+            log.warning("  Skipping %s — no parseable amount tag (not a known-cancelled voucher)", ref)
+            _note_skip_example(skip_examples, ref, v)
+            continue
+
+        records.append({
+            "voucher_number": ref,
+            "sale_date":      v_date.isoformat() if v_date else None,
+            "customer_name":  html.unescape(party_m.group(1).strip()) if party_m else None,
+            "amount":         amount,
+            "stock_item":     html.unescape(stock_m.group(1).strip()) if stock_m else None,
+            "quantity":       _parse_qty(qty_m.group(1))  if qty_m  else None,
+            "rate":           _parse_rate(rate_m.group(1)) if rate_m else None,
+            "voucher_type":   vtype_m.group(1).strip(),
+            "synced_at":      synced_at,
+        })
+
+    if skipped_cancelled:
+        log.info("  Skipped %d cancelled voucher(s)", skipped_cancelled)
+    log.info(
+        "  AlterID > %d: %d raw voucher(s), %d added, max AlterID seen %d",
+        min_alterid, len(vouchers), len(records), max_alterid,
+    )
+    return records, max_alterid
 
 
-def sync_sales_history(dry_run: bool = False, full: bool = False):
+def _upsert_sales_records(all_records: list, dry_run: bool) -> float:
     """
-    Upsert Sales Vouchers into sales_history, keyed on voucher_number.
-    Normal runs only touch the current month + a rotating older FY month
-    (see module docstring above Step 10). Pass full=True (the --full CLI
-    flag) for a complete FY sweep. Caller should catch exceptions (non-fatal
-    step) — a single bad month chunk is already handled internally and never
-    aborts the others.
+    Shared dedup + upsert + UUID-backfill tail used by every Step 10 mode
+    (full sweep, AlterID incremental, month-based fallback). Returns today's
+    total, for the Step9-vs-Step10 reconcile cross-check.
     """
-    fy_start = _fy_start()
-    today    = date.today()
-
-    skip_examples = []
-
-    if full:
-        months_to_fetch = _fy_months(fy_start, today)
-        log.info("Step 10 — FULL FY refresh (--full): %d month(s), %s → %s", len(months_to_fetch), fy_start, today)
-    else:
-        months_to_fetch, state = _pick_incremental_months(fy_start, today)
-        if not dry_run:
-            _save_state(state)
-        log.info(
-            "Step 10 — incremental sync: %s%s",
-            [f"{y}-{m:02d}" for y, m in months_to_fetch],
-            " (state not persisted — dry run)" if dry_run else "",
-        )
-
-    all_records = []
-    for (y, m) in months_to_fetch:
-        all_records.extend(_fetch_sales_month_chunk(y, m, today, skip_examples))
-
-    _write_skip_examples_debug_file(skip_examples)
-
+    today = date.today()
     log.info("  Total records collected (before dedup): %d", len(all_records))
     if all_records:
-        sample = [r["voucher_number"] for r in all_records[:8]]
-        log.info("  Sample voucher numbers (first 8): %s", sample)
+        log.info("  Sample voucher numbers (first 8): %s", [r["voucher_number"] for r in all_records[:8]])
 
     # Deduplicate by voucher_number — last occurrence wins (handles chunk-boundary overlaps)
     seen = {}
@@ -1661,9 +1778,6 @@ def sync_sales_history(dry_run: bool = False, full: bool = False):
         seen[rec["voucher_number"]] = rec
     all_records = list(seen.values())
     log.info("  After dedup: %d unique voucher numbers", len(all_records))
-    if all_records:
-        sample_dedup = [r["voucher_number"] for r in all_records[:8]]
-        log.info("  Sample after dedup (first 8): %s", sample_dedup)
 
     if not all_records:
         log.warning("  No sales records found — skipping upsert")
@@ -1755,6 +1869,238 @@ def sync_sales_history(dry_run: bool = False, full: bool = False):
         log.info("  UUID backfill: no null-customer_id rows — already clean")
 
     return today_total
+
+
+def _reconcile_sales_history_deletions(fy_start: date, today: date, current_voucher_numbers: set, dry_run: bool) -> int:
+    """
+    Delete sales_history rows in [fy_start, today] whose voucher_number isn't
+    in current_voucher_numbers (this run's freshly fetched, complete set for
+    that range). A row missing from that set is treated as "shouldn't be
+    there" whether the voucher was truly deleted in Tally or simply cancelled
+    after being a real sale — both are excluded from every Step 10 fetch, so
+    "not in the current set" is the correct signal either way.
+
+    Refuses to delete anything if it would remove more than
+    SALES_HISTORY_DELETE_SANITY_LIMIT of the range's previously-tracked rows
+    — a second guard on top of the caller's own "skip if any chunk failed"
+    check, in case the fetch was subtly wrong in a way that still reported
+    itself as fully successful.
+    """
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+    existing = set()
+    offset = 0
+    while True:
+        batch = (
+            supa.table("sales_history")
+            .select("voucher_number")
+            .gte("sale_date", fy_start.isoformat())
+            .lte("sale_date", today.isoformat())
+            .range(offset, offset + 999)
+            .execute().data
+        ) or []
+        existing.update(r["voucher_number"] for r in batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    to_delete = existing - current_voucher_numbers
+    if not to_delete:
+        log.info("  Deletion reconciliation: nothing to remove (%d existing, all still present in Tally)", len(existing))
+        return 0
+
+    if existing and len(to_delete) / len(existing) > SALES_HISTORY_DELETE_SANITY_LIMIT:
+        log.warning(
+            "  Deletion reconciliation SKIPPED — would remove %d / %d (%.0f%%) of tracked vouchers, "
+            "over the %.0f%% sanity limit. A broken fetch can look exactly like a wave of deletions — "
+            "investigate before trusting this.",
+            len(to_delete), len(existing), len(to_delete) / len(existing) * 100,
+            SALES_HISTORY_DELETE_SANITY_LIMIT * 100,
+        )
+        return 0
+
+    log.warning(
+        "  Deletion reconciliation: %d voucher(s) no longer in Tally (deleted or cancelled) — removing from sales_history",
+        len(to_delete),
+    )
+    if dry_run:
+        log.info("  DRY RUN — deletion skipped")
+        return len(to_delete)
+
+    to_delete_list = list(to_delete)
+    for i in range(0, len(to_delete_list), 200):
+        chunk = to_delete_list[i : i + 200]
+        supa.table("sales_history").delete().in_("voucher_number", chunk).execute()
+    return len(to_delete)
+
+
+def _full_sales_history_sweep(dry_run: bool) -> "tuple[float, int]":
+    """
+    Complete FY sweep, month by month — the only Step 10 mode that can catch
+    deletions (see module docstring). Runs automatically every
+    SALES_HISTORY_FULL_SWEEP_DAYS and whenever --full is passed.
+
+    Deletion reconciliation is skipped (upserts still happen) if any month
+    chunk failed to fetch this run — an incomplete "current" picture must
+    never decide what's "missing", or one bad chunk could wipe out a whole
+    month of real data. Returns (today_total, max_alterid_seen).
+    """
+    fy_start = _fy_start()
+    today    = date.today()
+    months   = _fy_months(fy_start, today)
+    log.info("Step 10 — FULL FY sweep: %d month(s), %s → %s", len(months), fy_start, today)
+
+    skip_examples   = []
+    all_records     = []
+    current_numbers = set()
+    max_alterid     = 0
+    all_chunks_ok   = True
+
+    for (y, m) in months:
+        result = _fetch_sales_month_chunk(y, m, today, skip_examples)
+        if not result["ok"]:
+            all_chunks_ok = False
+        all_records.extend(result["records"])
+        current_numbers.update(r["voucher_number"] for r in result["records"])
+        max_alterid = max(max_alterid, result["max_alterid"])
+
+    _write_skip_examples_debug_file(skip_examples)
+
+    if not all_chunks_ok:
+        log.warning("  One or more month chunks failed this sweep — deletion reconciliation SKIPPED (upserts still applied)")
+    else:
+        _reconcile_sales_history_deletions(fy_start, today, current_numbers, dry_run)
+
+    today_total = _upsert_sales_records(all_records, dry_run)
+    return today_total, max_alterid
+
+
+def _sync_sales_history_alterid(dry_run: bool) -> "tuple[float, int, str]":
+    """
+    AlterID incremental Step 10 path — every run, no throttle needed, since
+    by construction it only ever fetches what actually changed since the
+    last seen AlterID. Only reached when ALTERID_SYNC_ENABLED is True.
+    """
+    state       = _load_state()
+    min_alterid = state.get("last_alterid", 0)
+    log.info("Step 10 — AlterID incremental: fetching sales vouchers with AlterID > %d", min_alterid)
+
+    skip_examples       = []
+    records, max_alterid = _fetch_sales_by_alterid(min_alterid, skip_examples)
+    _write_skip_examples_debug_file(skip_examples)
+
+    new_max = max(min_alterid, max_alterid)
+    if not dry_run:
+        state["last_alterid"] = new_max
+        _save_state(state)
+
+    today_total = _upsert_sales_records(records, dry_run)
+    return today_total, new_max, "alterid"
+
+
+def _sync_sales_history_fallback(dry_run: bool) -> "tuple[float | None, int, str]":
+    """
+    Month-based Step 10 path, used while ALTERID_SYNC_ENABLED is False.
+    Fetches the current month at most every FALLBACK_CURRENT_MONTH_HOURS,
+    and one older FY month (rotating; the previous month first for
+    NEW_MONTH_CATCHUP_RUNS runs after a month rollover, to catch late
+    entries) at most every FALLBACK_OLDER_MONTH_HOURS — instead of both
+    every single run. Returns (today_total, max_alterid_seen, mode); mode is
+    "skipped" and today_total is None if neither throttle was due this run,
+    so the caller never feeds a stale/absent fetch into the Step9-vs-Step10
+    reconcile cross-check as if it were a real number.
+    """
+    fy_start   = _fy_start()
+    today      = date.today()
+    all_months = _fy_months(fy_start, today)
+    current    = (today.year, today.month)
+    month_key  = f"{today.year:04d}-{today.month:02d}"
+
+    state = _load_state()
+    if state.get("last_seen_month") != month_key:
+        state["last_seen_month"]     = month_key
+        state["new_month_runs_done"] = 0
+
+    months_to_fetch = []
+
+    if _is_due(state.get("last_current_month_fetch_at"), FALLBACK_CURRENT_MONTH_HOURS):
+        months_to_fetch.append(current)
+        state["last_current_month_fetch_at"] = datetime.now(UTC).isoformat()
+
+    if _is_due(state.get("last_older_month_fetch_at"), FALLBACK_OLDER_MONTH_HOURS):
+        prev_month = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+        if (prev_month in all_months and prev_month != current
+                and state.get("new_month_runs_done", 0) < NEW_MONTH_CATCHUP_RUNS):
+            older_pick = prev_month
+            state["new_month_runs_done"] = state.get("new_month_runs_done", 0) + 1
+        else:
+            older = [m for m in all_months if m != current]
+            if older:
+                idx = state.get("rotation_index", 0) % len(older)
+                older_pick = older[idx]
+                state["rotation_index"] = state.get("rotation_index", 0) + 1
+            else:
+                older_pick = None
+        if older_pick and older_pick not in months_to_fetch:
+            months_to_fetch.append(older_pick)
+            state["last_older_month_fetch_at"] = datetime.now(UTC).isoformat()
+
+    if not dry_run:
+        _save_state(state)
+
+    if not months_to_fetch:
+        log.info(
+            "Step 10 — SKIPPED this run (current month fetched < %dh ago, older month < %dh ago)",
+            FALLBACK_CURRENT_MONTH_HOURS, FALLBACK_OLDER_MONTH_HOURS,
+        )
+        return None, state.get("last_alterid", 0), "skipped"
+
+    log.info("Step 10 — fallback sync: %s", [f"{y}-{m:02d}" for y, m in months_to_fetch])
+
+    skip_examples = []
+    all_records   = []
+    max_alterid   = state.get("last_alterid", 0)
+    for (y, m) in months_to_fetch:
+        result = _fetch_sales_month_chunk(y, m, today, skip_examples)
+        all_records.extend(result["records"])
+        max_alterid = max(max_alterid, result["max_alterid"])
+    _write_skip_examples_debug_file(skip_examples)
+
+    if not dry_run and max_alterid != state.get("last_alterid", 0):
+        state = _load_state()
+        state["last_alterid"] = max_alterid
+        _save_state(state)
+
+    today_total = _upsert_sales_records(all_records, dry_run)
+    return today_total, max_alterid, "fallback"
+
+
+def sync_sales_history(dry_run: bool = False, full: bool = False) -> "tuple[float | None, int, str]":
+    """
+    Step 10 orchestrator. Picks one of three paths per run — see the module
+    docstring above Step 10. Returns (today_total, max_alterid_seen, mode);
+    today_total is None only when mode == "skipped" (nothing fetched this
+    run) — the caller must not treat that as a real zero for the
+    Step9-vs-Step10 reconcile cross-check.
+    """
+    state          = _load_state()
+    full_sweep_due = full or _is_due(state.get("last_full_sales_history_sweep"), SALES_HISTORY_FULL_SWEEP_DAYS * 24)
+
+    if full_sweep_due:
+        log.info("Step 10 mode: FULL SWEEP (%s)", "--full" if full else f"{SALES_HISTORY_FULL_SWEEP_DAYS}-day schedule")
+        today_total, max_alterid = _full_sales_history_sweep(dry_run)
+        if not dry_run:
+            state = _load_state()
+            state["last_full_sales_history_sweep"] = datetime.now(UTC).isoformat()
+            state["last_alterid"] = max(state.get("last_alterid", 0), max_alterid)
+            _save_state(state)
+        return today_total, max_alterid, "full"
+
+    if ALTERID_SYNC_ENABLED:
+        log.info("Step 10 mode: ALTERID incremental")
+        return _sync_sales_history_alterid(dry_run)
+
+    log.info("Step 10 mode: month-based fallback (ALTERID_SYNC_ENABLED=False)")
+    return _sync_sales_history_fallback(dry_run)
 
 
 # ── Reconciliation ─────────────────────────────────────────────────────────────
@@ -1932,6 +2278,7 @@ def backfill_mode(from_date: date, to_date: date, force: bool, dry_run: bool):
     Does NOT re-run Steps 1-8 (outstanding) or Step 10 (sales_history) — those
     are not date-scoped in the same way.
     """
+    backfill_start = time.monotonic()
     total_days = (to_date - from_date).days + 1
     log.info(
         "[BACKFILL] Range: %s → %s | %d day(s) | force=%s | dry_run=%s",
@@ -1988,8 +2335,8 @@ def backfill_mode(from_date: date, to_date: date, force: bool, dry_run: bool):
         current += timedelta(days=1)
 
     log.info(
-        "[BACKFILL] Finished — %d synced, %d skipped, %d total",
-        synced, skipped, total_days,
+        "[BACKFILL] Finished in %.1fs — %d synced, %d skipped, %d total",
+        time.monotonic() - backfill_start, synced, skipped, total_days,
     )
 
 
@@ -1999,7 +2346,7 @@ def main():
     parser = argparse.ArgumentParser(description="SBDC Tally → Supabase sync")
     parser.add_argument("--dry-run",    action="store_true", help="Parse without DB writes")
     parser.add_argument("--from-local", action="store_true", help="Use tally_with_dates.xml instead of live Tally")
-    parser.add_argument("--full",       action="store_true", help="Full FY sales_history sweep instead of the incremental current+rotation months")
+    parser.add_argument("--full",       action="store_true", help="Force a full FY sales_history sweep + deletion reconciliation now, instead of waiting for the weekly schedule")
     parser.add_argument("--backfill",   action="store_true", help="Backfill daily_sales/collections for a date range")
     parser.add_argument("--from",       dest="from_date", metavar="YYYY-MM-DD", help="Backfill start date (inclusive)")
     parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
@@ -2053,17 +2400,25 @@ def main():
 
         # Per-step status — the honest record of what actually happened this run,
         # instead of a single "success" that used to be written even when Tally
-        # was never reached for Steps 9/9b/10. "skipped" covers --from-local,
-        # where these steps deliberately don't run at all.
+        # was never reached for Steps 9/9b/10. "skipped" covers both
+        # --from-local (Steps 9/9b/10 can't run — no Tally) and a heavy step
+        # being intentionally throttled this run; either way it must not read
+        # as "failed" or drag the overall status down to "partial".
         step_status = {
             "outstanding":   "pending",
             "today_sales":   "skipped",
             "collections":   "skipped",
             "sales_history": "skipped",
+            "ledger_master": "skipped",   # informational only — never gates overall_status
         }
         reconcile_status = None
+        run_start        = time.monotonic()
 
         try:
+            bills = []
+            inserted, skipped, unmatched, auto_inserted = 0, 0, {}, []
+            outstanding_ran = False
+
             if from_local:
                 local_xml = BASE_DIR / "tally_with_dates.xml"
                 if not local_xml.exists():
@@ -2073,38 +2428,76 @@ def main():
                 log.info("Steps 1-2 — SKIPPED (--from-local mode)")
                 log.info("  Reading: %s", local_xml)
                 xml_text = local_xml.read_text(encoding="utf-8", errors="replace")
+                bills = parse_xml(xml_text)
+                inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
+                step_status["outstanding"] = "success"
+                outstanding_ran = True
             else:
                 if not check_tally():
                     raise RuntimeError(
                         "Tally not reachable. Run from the office network with Tally open."
                     )
-                xml_text = fetch_tally_xml()
 
-            bills = parse_xml(xml_text)
+                # Step 2/3 (Bills Receivable) — only if it's actually been a
+                # while. This is the single biggest Tally request in the whole
+                # runner; re-running it every 30 minutes was a large part of
+                # what was keeping the shared billing PC busy.
+                prev_status      = _load_last_status()
+                last_outstanding = prev_status.get("last_success", {}).get("outstanding")
+                outstanding_due  = _is_due(last_outstanding, OUTSTANDING_THROTTLE_HOURS)
 
-            # Steps 4.5 + 4.6 — fetch ledger master once, use for both new-customer
-            # insert and contact-field refresh (avoids a second round-trip to Tally).
-            auto_inserted = []
-            if not from_local:
-                try:
-                    log.info("Step 4.5/4.6 — Fetching Tally ledger master")
-                    ledger_data = _fetch_tally_ledger_master()
-                    log.info("  Ledger master: %d records fetched", len(ledger_data))
-                    auto_inserted = auto_insert_new_customers(bills, ledger_data=ledger_data, dry_run=dry_run)
-                    refresh_ledger_contacts(ledger_data, dry_run=dry_run)
-                except Exception as exc:
-                    log.warning(
-                        "Step 4.5/4.6 WARNING — Ledger sync failed (non-fatal): %s", exc
+                if outstanding_due:
+                    xml_text = fetch_tally_xml()
+                    bills = parse_xml(xml_text)
+                    inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
+                    step_status["outstanding"] = "success"
+                    outstanding_ran = True
+                else:
+                    log.info(
+                        "Step 2/3 SKIPPED — outstanding last synced %.1fh ago (throttle: %dh)",
+                        _hours_since(last_outstanding), OUTSTANDING_THROTTLE_HOURS,
                     )
+                    step_status["outstanding"] = "skipped"
 
-            inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
-            step_status["outstanding"] = "success"
+                # Step 4.5/4.6 — its own daily throttle, independent of the
+                # outstanding throttle above. 4.6 (contact refresh) doesn't
+                # need bills, so it still runs on its own schedule; 4.5
+                # (auto-insert) needs THIS run's bills to know what's new, so
+                # it's a harmless no-op — not a failure — on a run where
+                # Step 2/3 above was itself throttled.
+                run_state         = _load_state()
+                last_ledger_run   = run_state.get("last_ledger_master_run")
+                ledger_master_due = _is_due(last_ledger_run, LEDGER_MASTER_THROTTLE_HOURS)
+
+                if ledger_master_due:
+                    try:
+                        log.info("Step 4.5/4.6 — Fetching Tally ledger master")
+                        ledger_data = _fetch_tally_ledger_master()
+                        log.info("  Ledger master: %d records fetched", len(ledger_data))
+                        if outstanding_ran:
+                            auto_inserted = auto_insert_new_customers(bills, ledger_data=ledger_data, dry_run=dry_run)
+                        else:
+                            log.info("  Step 4.5 (auto-insert) skipped — no fresh bills this run (Step 2/3 was throttled)")
+                        refresh_ledger_contacts(ledger_data, dry_run=dry_run)
+                        step_status["ledger_master"] = "success"
+                        if not dry_run:
+                            run_state["last_ledger_master_run"] = datetime.now(UTC).isoformat()
+                            _save_state(run_state)
+                    except Exception as exc:
+                        log.warning("Step 4.5/4.6 WARNING — Ledger sync failed (non-fatal): %s", exc)
+                        step_status["ledger_master"] = "failed"
+                else:
+                    log.info(
+                        "Step 4.5/4.6 SKIPPED — ledger master last refreshed %.1fh ago (throttle: %dh)",
+                        _hours_since(last_ledger_run), LEDGER_MASTER_THROTTLE_HOURS,
+                    )
+                    step_status["ledger_master"] = "skipped"
 
             if unmatched:
                 log.warning("  Sending skip alert for %d unmatched customer(s)", len(unmatched))
                 _send_skip_alert_email(unmatched)
 
-            step9_count, step9_total, step10_today = 0, 0.0, 0.0
+            step9_count, step9_total, step10_today, step10_mode = 0, 0.0, None, None
             if not from_local:
                 try:
                     step9_count, step9_total = sync_today_sales(dry_run=dry_run)
@@ -2121,53 +2514,71 @@ def main():
                     step_status["collections"] = "failed"
 
                 try:
-                    step10_today = sync_sales_history(dry_run=dry_run, full=args.full) or 0.0
-                    step_status["sales_history"] = "success"
+                    step10_today, _step10_alterid, step10_mode = sync_sales_history(dry_run=dry_run, full=args.full)
+                    step_status["sales_history"] = "skipped" if step10_mode == "skipped" else "success"
                 except Exception as exc:
                     log.warning("Step 10 WARNING — Sales history sync failed (non-fatal): %s", exc)
                     step_status["sales_history"] = "failed"
+                    step10_today = None
 
                 if not dry_run:
-                    try:
-                        reconcile_status = reconcile_sync(date.today(), step9_total, step10_today, step9_count)
-                    except Exception as exc:
-                        log.warning("RECONCILE WARNING — Post-sync check failed (non-fatal): %s", exc)
-                        reconcile_status = "MISMATCH"
+                    if step10_today is not None:
+                        try:
+                            reconcile_status = reconcile_sync(date.today(), step9_total, step10_today, step9_count)
+                        except Exception as exc:
+                            log.warning("RECONCILE WARNING — Post-sync check failed (non-fatal): %s", exc)
+                            reconcile_status = "MISMATCH"
+                    else:
+                        log.info("RECONCILE — skipped (Step 10 fetched nothing fresh this run, so there's nothing to cross-check Step 9 against)")
 
             # ── Overall status ──────────────────────────────────────────────────
-            # "success" only if every step that was supposed to run this mode did;
-            # a confirmed reconcile MISMATCH also downgrades to "partial" even if
-            # every individual step nominally succeeded, since it means the data
-            # those steps wrote doesn't actually agree with itself.
+            # "success" if every step that was supposed to run this mode either
+            # succeeded or was intentionally skipped (throttled, or --from-local
+            # where a step simply can't run) — a skip on purpose must never read
+            # as a failure or drag this to "partial". ledger_master is excluded
+            # here deliberately: it was always fully non-fatal, even before
+            # throttling existed. A confirmed reconcile MISMATCH still downgrades
+            # to "partial" even if every individual step nominally succeeded,
+            # since it means the data those steps wrote doesn't agree with itself.
             core_steps_ok = all(
-                step_status[s] in ("success", "skipped") for s in ("today_sales", "collections", "sales_history")
+                step_status[s] in ("success", "skipped")
+                for s in ("outstanding", "today_sales", "collections", "sales_history")
             )
             if core_steps_ok and reconcile_status != "MISMATCH":
                 overall_status = "success"
             else:
                 overall_status = "partial"
 
+            elapsed_s = time.monotonic() - run_start
             summary = {
-                "bills_from_tally":    len(bills),
-                "loaded_to_supabase":  inserted,
-                "skipped_no_match":    skipped,
+                "bills_from_tally":    len(bills) if outstanding_ran else None,
+                "loaded_to_supabase":  inserted if outstanding_ran else None,
+                "skipped_no_match":    skipped if outstanding_ran else None,
                 "new_customers_added": len(auto_inserted),
                 "new_customer_names":  auto_inserted,
                 "skipped_names":       [
                     {"name": n, "bills": c} for n, c in sorted(unmatched.items(), key=lambda x: -x[1])
                 ],
                 "reconcile_status":    reconcile_status,
+                "sales_history_mode":  step10_mode,
+                "duration_seconds":    round(elapsed_s, 1),
             }
             _write_status(overall_status, step_status, summary, dry_run=dry_run)
 
             log.info("=" * 60)
             log.info("SYNC %s%s", overall_status.upper(), " (DRY RUN)" if dry_run else "")
-            log.info("  Bills from Tally       : %d", len(bills))
-            log.info("  New customers added    : %d%s",
-                     len(auto_inserted),
-                     (" — " + ", ".join(auto_inserted)) if auto_inserted else "")
-            log.info("  Loaded to Supabase     : %d", inserted)
-            log.info("  Skipped (no match)     : %d", skipped)
+            log.info("  Duration               : %.1fs", elapsed_s)
+            if outstanding_ran:
+                log.info("  Bills from Tally       : %d", len(bills))
+                log.info("  New customers added    : %d%s",
+                         len(auto_inserted),
+                         (" — " + ", ".join(auto_inserted)) if auto_inserted else "")
+                log.info("  Loaded to Supabase     : %d", inserted)
+                log.info("  Skipped (no match)     : %d", skipped)
+            else:
+                log.info("  Outstanding (Step 2/3) : SKIPPED this run (throttled)")
+            if step10_mode:
+                log.info("  Sales history mode     : %s", step10_mode)
             log.info("  Step status            : %s", step_status)
             if reconcile_status:
                 log.info("  Reconcile              : %s", reconcile_status)
@@ -2179,7 +2590,13 @@ def main():
             log.exception("SYNC FAILED: %s", error_msg)
             log.error("Log saved to: %s", log_path)
             step_status["outstanding"] = "failed"
-            _write_status("failed", step_status, {"error": error_msg, "log": str(log_path)}, dry_run=dry_run)
+            elapsed_s = time.monotonic() - run_start
+            log.error("  Duration before failure: %.1fs", elapsed_s)
+            _write_status(
+                "failed", step_status,
+                {"error": error_msg, "log": str(log_path), "duration_seconds": round(elapsed_s, 1)},
+                dry_run=dry_run,
+            )
             _send_failure_email(error_msg)
             sys.exit(1)
 

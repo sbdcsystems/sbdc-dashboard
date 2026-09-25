@@ -22,6 +22,8 @@ sbdc-system/
   venv/                       ← Python virtualenv (root level)
   backend/
     tally_sync_runner.py      ← main sync script (Steps 1-10)
+    compare_step3.py          ← standalone read-only old-vs-new Step 3 sign-logic comparison (see step3-sign-fix branch)
+    probe_alterid.py          ← standalone diagnostic: does this Tally install support AlterID filtering? Run before flipping ALTERID_SYNC_ENABLED
     full_customer_import.py   ← one-time ledger master import (reference only)
     assign_one.py             ← one-off manual assignment script
     add_customers.py          ← one-off customer insert script
@@ -29,7 +31,7 @@ sbdc-system/
     probe_tally_reports.py    ← diagnostic: test Tally report types
     logs/                     ← sync logs (sync_YYYYMMDD_HHMMSS.log)
     last_sync_status.json     ← written after every sync run (overall + per-step status, see below)
-    sync_state.json           ← sales_history rotation pointer (not committed — machine-local runtime state)
+    sync_state.json           ← sales_history rotation/throttle state incl. last_alterid, last_ledger_master_run (not committed — machine-local runtime state)
     sync.lock                 ← overlap guard, present only while a sync is running (not committed)
     debug_skipped_vouchers.xml ← Phase 4 debug capture, written when Step 10 skips a voucher with no parseable amount (not committed)
     tally_with_dates.xml      ← local XML backup for --from-local mode
@@ -53,17 +55,21 @@ cd C:\Users\vsome\Desktop\sbdc-system\backend
 ..\venv\Scripts\activate.bat
 
 # Full sync (must be on office network with Tally open):
-# — incremental: current month + one rotating older FY month for sales_history
+# — heavy steps (outstanding, ledger master, sales_history) are throttled;
+#   see "Load-reduction throttles" below for exactly when each one fires.
 python tally_sync_runner.py
 
-# Full FY sales_history sweep (manual — normal scheduled runs don't do this):
+# Force a full FY sales_history sweep + deletion reconciliation now:
 python tally_sync_runner.py --full
 
 # Parse local XML backup without Tally connection (outstanding only — Steps 9/9b/10 skipped, can't reach Tally):
 python tally_sync_runner.py --from-local
 
-# Dry run (no DB writes, no Supabase sync_status write either):
+# Dry run (no DB writes, no Supabase sync_status write, no throttle state persisted either):
 python tally_sync_runner.py --from-local --dry-run
+
+# One-time diagnostic before enabling ALTERID_SYNC_ENABLED — see "Load-reduction throttles":
+python probe_alterid.py
 ```
 
 A `sync.lock` file prevents two runs overlapping — if you see "Another sync is already running" and you're sure nothing is actually running, it's safe to delete `backend/sync.lock` (the runner also auto-clears it if the PID is dead or it's >20 min old).
@@ -305,33 +311,52 @@ Writing to this table is best-effort (wrapped in try/except) — the sync never 
 
 | Step | Function | Description |
 |---|---|---|
-| 1 | `check_tally()` | Ping Tally HTTP API — retries up to 3× with backoff |
-| 2 | `fetch_tally_xml()` | Fetch Bills Receivable XML, save backup |
-| 3 | `parse_xml()` | Parse bill entries, tag age/bucket |
-| 4 | `reload_supabase()` | Build customer map from DB |
-| **4.5** | `auto_insert_new_customers()` | Auto-insert new customers from Tally ledger master |
+| 1 | `check_tally()` | Ping Tally HTTP API — retries up to 3× with backoff. **Always runs.** |
+| 2 | `fetch_tally_xml()` | Fetch Bills Receivable XML, save backup. **Throttled** — only if last successful run > `OUTSTANDING_THROTTLE_HOURS` (3h) old |
+| 3 | `parse_xml()` | Parse bill entries, tag age/bucket. Runs iff Step 2 ran |
+| 4 | `reload_supabase()` | Build customer map from DB. Runs iff Step 2/3 ran |
+| **4.5** | `auto_insert_new_customers()` | Auto-insert new customers from Tally ledger master. **Throttled** with 4.6 (once a day); additionally a no-op (not a failure) on a run where Step 2/3 was itself throttled, since it needs this run's freshly parsed bills |
 | 5 | inside reload_supabase | Sanity check (abort if >50% drop) |
 | 6 | inside reload_supabase | Clear any partial rows from a failed previous run |
 | 7 | inside reload_supabase | Insert all new outstanding rows |
 | 8 | inside reload_supabase | Delete old rows (previous sync timestamp) |
-| 9 | `sync_today_sales()` | TDL Collection with a server-side date+type+not-cancelled `<FILTER>`, today only, upsert daily_sales |
-| 9b | `sync_today_collections()` | Same TDL Collection + `<FILTER>` approach as Step 9 (`Receipt`/`PoS Receipt`/`Cash Receipt` types), upsert daily_collections — **no longer uses Day Book** |
-| 10 | `sync_sales_history()` | Current month + one rotating older FY month per run (see below), each with a server-side date-range+type+not-cancelled `<FILTER>`; `--full` does the complete FY sweep |
+| 9 | `sync_today_sales()` | TDL Collection with a server-side date+type+not-cancelled `<FILTER>`, today only, upsert daily_sales. **Always runs** (small, filtered request) |
+| 9b | `sync_today_collections()` | Same approach as Step 9 (`Receipt`/`PoS Receipt`/`Cash Receipt` types), upsert daily_collections. **Always runs** |
+| 10 | `sync_sales_history()` | Full FY sweep weekly/`--full`, AlterID incremental once confirmed, month-based fallback otherwise — see below. **Throttled**, mode varies |
 
-Steps 9, 9b, and 10 are **non-fatal** — wrapped in try/except so a Tally timeout doesn't abort the outstanding sync, and each is tracked individually in `sync_status`/`last_sync_status.json` so a degraded run shows as `partial`, not silently as `success`.
-Step 4.5 is also non-fatal and **skipped in `--from-local` mode** (can't reach Tally).
+Steps 9, 9b, and 10 are **non-fatal** — wrapped in try/except so a Tally timeout doesn't abort the outstanding sync, and each is tracked individually in `sync_status`/`last_sync_status.json` so a degraded run shows as `partial`, not silently as `success`. Step 4.5/4.6 is also non-fatal, tracked under an informational `ledger_master` key that never gates `overall_status` (same as before throttling existed), and is **skipped entirely in `--from-local` mode** (can't reach Tally).
 
 **Never treat an exception from Steps 9/9b as "zero"**: `_fetch_vouchers_for_day()` raises if Tally's response is implausibly small, or if Tally reports a TDL error (`_raise_on_tally_error` — a `<LINEERROR>` in the response, e.g. a bad filter formula), rather than silently returning an empty result — a broken fetch must never overwrite `daily_sales`/`daily_collections` with 0. The existing per-step try/except means nothing gets upserted at all when that happens; the previous value is left untouched. See "Confirmed live facts" above for what's actually been verified about the filters themselves vs. what's this codebase's untested extrapolation.
 
 **Cancelled vouchers**: `IsCancelled=Yes` vouchers are excluded server-side (`NOT $IsCancelled` in the filter) and, as a safety net, also skipped client-side — Steps 9/9b/10 all check `_is_voucher_cancelled()` and log one aggregate INFO count, not a warning per voucher. This is what the old per-voucher "no parseable amount tag" warnings in Step 10 turned out to be.
 
-**Incremental sales_history (Step 10)**: re-fetching the whole FY every run was overloading the (weak) billing PC — the April chunk alone was 14,161 raw voucher tags and took 60s, and by the time the loop reached June the connection was being reset, then refused outright. A scheduled run now only fetches the current month plus one older FY month chosen in rotation (pointer kept in `backend/sync_state.json`), plus the previous month for the first `NEW_MONTH_CATCHUP_RUNS` (6) runs after a month rolls over. With ~18 runs/day the full FY still gets covered, just spread out instead of repeated every single run. `--full` forces a complete sweep. Upserts are keyed on `voucher_number` and this step never deletes, so an incremental run can't lose data — it can only be behind on months it hasn't rotated to yet.
-
 **Overlap lock**: `sync.lock` (pid + start time) stops two runs from overlapping. Treated as stale — removed and the new run proceeds — if the recorded PID isn't running, or the lock is older than 20 minutes (the office PC is switched off at 7 PM and can be shut down mid-run, which would otherwise leave a lock nothing could ever clear).
 
-**RECONCILE tri-state**: the post-sync voucher-count cross-check reports `OK`, `MISMATCH`, or `UNKNOWN` — previously an exception while fetching Tally's independent count silently left the status at `OK` (the `count_ok` flag defaulted `True` and nothing set it `False` on that path). `UNKNOWN` doesn't fail the run; a confirmed `MISMATCH` downgrades the overall run status to `partial`.
+**RECONCILE tri-state**: the post-sync voucher-count cross-check reports `OK`, `MISMATCH`, or `UNKNOWN` — previously an exception while fetching Tally's independent count silently left the status at `OK` (the `count_ok` flag defaulted `True` and nothing set it `False` on that path). `UNKNOWN` doesn't fail the run; a confirmed `MISMATCH` downgrades the overall run status to `partial`. Now also skipped outright (logged, not a mismatch) on a run where Step 10 didn't fetch anything fresh (`sync_sales_history` returned `None`) — comparing Step 9's fresh total against a stale/absent Step 10 number would flag a mismatch purely because Step 10 was throttled, not because anything's actually wrong.
 
 **Timestamp rule — any value written to a Supabase `timestamptz` column must be timezone-aware** (`datetime.now(UTC)`, not `datetime.now()`). A naive local datetime's `.isoformat()` has no offset in the string, so Postgres has no way to know it was IST and stores it as if it were UTC — a real bug caught in `_write_status()`: `sync_status.run_at` for an 18:31 IST run was stored as `18:31:28+00`, 5.5 hours off. Fixed by splitting it into `now_utc_iso` (aware — used for `run_at` and every `last_success_*` column) and `now_local_iso` (naive — used only for `last_sync_status.json`'s own `"timestamp"` field, a local log-style value nobody reads except a human on that machine, same convention as `RUN_TS`). Values that never reach Supabase (`sync.lock`'s `started_at`, `RUN_TS`, email body/subject text, the XML-backup retention cutoff) are fine staying naive local — the bug is specifically about the round trip through a `timestamptz` column.
+
+---
+
+## Load-reduction throttles (25-Sep-2026)
+
+The office reported Tally lagging on every connected PC — each scheduled run's heavy steps kept the shared billing PC busy 80-120s every 30 minutes. Steps 1/9/9b stay light and always run (small, filtered requests already); everything else now reuses previous data instead of refetching it, gated by how long it's actually been since it last ran. Throttle windows are constants near the top of `tally_sync_runner.py`: `OUTSTANDING_THROTTLE_HOURS` (3h), `LEDGER_MASTER_THROTTLE_HOURS` (24h), `SALES_HISTORY_FULL_SWEEP_DAYS` (7d), `FALLBACK_CURRENT_MONTH_HOURS` (2h), `FALLBACK_OLDER_MONTH_HOURS` (24h).
+
+**Due decisions read real elapsed time, not a call count** — `_is_due(iso_str, hours)` (missing/unparseable timestamp = always due) checks against `last_success.outstanding` in `last_sync_status.json` for Step 2/3, and against fields in `sync_state.json` for the ledger master and Step 10.
+
+**dry_run must never advance a throttle.** `_write_status()` only updates `last_success[step]` when `not dry_run` — a `--dry-run` test run doesn't actually write to that step's target table, so it must not count as a "last success" for throttling purposes (it would otherwise silently suppress the next `OUTSTANDING_THROTTLE_HOURS` of real outstanding syncs). Every new state write this phase added (`last_ledger_master_run`, `last_alterid`, `last_current_month_fetch_at`, `last_older_month_fetch_at`, `last_full_sales_history_sweep`) is likewise gated by `if not dry_run`. Caught by an actual `main()`-level test (mocking Tally, calling `main()` twice in a row) before shipping — worth re-running that style of test if this logic changes again, since a unit test on the helper functions alone wouldn't have caught it.
+
+**Step 10 has three modes**, chosen by `sync_sales_history()`:
+
+1. **Full FY sweep** (`_full_sales_history_sweep`) — every `SALES_HISTORY_FULL_SWEEP_DAYS`, or whenever `--full` is passed (also true on a fresh install with no state file — `_is_due` on a missing timestamp is always `True`). The only mode that can detect deletions, since an incremental fetch (date-range OR AlterID) can only ever add/update. A voucher missing from the sweep's results is purged from `sales_history` whether it was truly deleted in Tally or simply cancelled after being a real sale — both are already excluded from every Step 10 fetch, so "not in the current set" is the right signal either way (see `_reconcile_sales_history_deletions`). Two safety layers: deletion is skipped entirely (upserts still happen) if any month chunk failed to fetch this sweep, and separately refused if it would remove more than `SALES_HISTORY_DELETE_SANITY_LIMIT` (20%) of the FY's previously-tracked vouchers — either could otherwise turn a temporary Tally hiccup into mass data loss.
+2. **AlterID incremental** (`_sync_sales_history_alterid`) — once `ALTERID_SYNC_ENABLED = True`. Every run, no throttle needed: it only ever fetches sales vouchers with Tally's `AlterID` greater than the highest one seen last time (`sync_state.json`'s `last_alterid`), which by construction is cheap regardless of frequency. AlterID increases company-wide on every create/edit, so this needs no date bound at all and picks up an edit or cancellation to an old invoice for free — a date-range fetch would never look at that month again once its rotation had passed.
+3. **Month-based fallback** (`_sync_sales_history_fallback`) — used while `ALTERID_SYNC_ENABLED` is `False` (the default). Same current+rotation idea as the original Phase 1 design, but now rate-limited instead of running every single call: current month at most every `FALLBACK_CURRENT_MONTH_HOURS`, one older FY month (previous month first, for `NEW_MONTH_CATCHUP_RUNS` runs after a rollover) at most every `FALLBACK_OLDER_MONTH_HOURS`. Returns `(None, ..., "skipped")` when neither throttle is due — `None`, not `0.0`, so a throttled run can never look like a real zero to the reconcile cross-check.
+
+**`ALTERID_SYNC_ENABLED` is `False` and must stay that way until verified live.** AlterID filtering (`$AlterID > N` in a TDL `<FILTER>`) is untested on this Tally install — only date filters have been confirmed (see "Confirmed live facts"). Run `backend/probe_alterid.py` on the office PC first: it fetches the current max AlterID among this FY's sales vouchers, then re-fetches with `AlterID > (max - 50)` and prints the count/timing/voucher list for a sanity check. Flip the constant to `True` only after confirming the output looks right. Self-contained (doesn't import `tally_sync_runner.py`), read-only, writes nothing anywhere.
+
+**`ledger_master` step status** is tracked in `sync_status`'s `steps` JSONB (an extra key alongside the four `STATUS_STEPS`) purely for visibility — it does not have its own `last_success_*` column and, matching its pre-throttling behaviour, never gates `overall_status`.
+
+**Run duration is now logged** for every mode (normal sync, backfill) and recorded in `sync_status`/`last_sync_status.json`'s `detail.duration_seconds`, alongside `detail.sales_history_mode` (`"full"`/`"alterid"`/`"fallback"`/`"skipped"`/`None`) — both requested specifically so a degraded/throttled run's actual behaviour is visible without reading the full log.
 
 ---
 
@@ -382,4 +407,4 @@ _STAFF_GROUPS = {
 
 Former staff (Vetri, Levaset, Kanagaraj) — their Tally groups map to Vijaya Priya in the assignment system.
 
-<!-- last updated: 2026-09-24 -->
+<!-- last updated: 2026-09-25 -->
