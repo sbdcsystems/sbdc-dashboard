@@ -669,6 +669,23 @@ export default function App() {
     return fyMonths.map(({ key, label }) => ({ date: label, total: mmap[key] || 0 }))
   }, [custDetail])
 
+  // Lock background scroll while the sheet is open — on mobile, a scrollable
+  // page behind a fixed-position sheet can rubber-band/shift under a tap,
+  // which is what made the close button miss on real phones even though it
+  // measured out fine in the DOM.
+  useEffect(() => {
+    if (!selectedCustomer) return
+    const original = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = original }
+  }, [selectedCustomer])
+
+  // Swipe-down-to-close on the sheet's grab handle/header only, so it
+  // doesn't fight with scrolling the sheet's own content.
+  const [sheetDragY, setSheetDragY] = useState(0)
+  const sheetDragStartY = useRef(null)
+  const sheetDragging    = useRef(false)
+
   // ── Auth gate — all hooks are above this, so early return is safe ──────────
 
   const handleLogin = e => {
@@ -777,6 +794,23 @@ export default function App() {
   function closeSheet() {
     setSelectedCustomer(null)
     setCustDetail(null)
+  }
+
+  function handleSheetDragStart(e) {
+    sheetDragStartY.current = e.touches[0].clientY
+    sheetDragging.current = true
+  }
+  function handleSheetDragMove(e) {
+    if (!sheetDragging.current || sheetDragStartY.current === null) return
+    const delta = e.touches[0].clientY - sheetDragStartY.current
+    if (delta > 0) setSheetDragY(delta)
+  }
+  function handleSheetDragEnd() {
+    if (!sheetDragging.current) return
+    sheetDragging.current = false
+    if (sheetDragY > 80) closeSheet()
+    setSheetDragY(0)
+    sheetDragStartY.current = null
   }
 
   const salesDisplayData = salesCardRows !== null ? _mergeCardRows(salesCardRows) : todaySales
@@ -1300,20 +1334,37 @@ export default function App() {
 
       {/* ── Customer detail sheet ── */}
       <div className="scrim" hidden={!selectedCustomer} onClick={closeSheet} />
-      <section className="sheet" role="dialog" aria-modal="true" hidden={!selectedCustomer}>
+      <section
+        className="sheet"
+        role="dialog"
+        aria-modal="true"
+        hidden={!selectedCustomer}
+        style={selectedCustomer ? {
+          transform: sheetDragY ? `translateY(${sheetDragY}px)` : undefined,
+          transition: sheetDragging.current ? 'none' : 'transform .25s cubic-bezier(.2,.9,.25,1)',
+        } : undefined}
+      >
         {selectedCustomer && (
           <>
-            <div className="grab"></div>
-            <div className="shead">
-              <div>
-                <h3>{selectedCustomer.customer_name}</h3>
-                <p>
-                  {selectedCustomer.assigned_to_name || 'Unassigned'}
-                  {selectedCustomer.customer_type === 'cash' ? ', cash customer' : `, ${selectedCustomer.credit_days || '—'} day credit`}
-                  {selectedCustomer.flagged && ` · ${selectedCustomer.flagged_reason}`}
-                </p>
+            <div
+              className="sheet-drag-handle"
+              onTouchStart={handleSheetDragStart}
+              onTouchMove={handleSheetDragMove}
+              onTouchEnd={handleSheetDragEnd}
+              onTouchCancel={handleSheetDragEnd}
+            >
+              <div className="grab"></div>
+              <div className="shead">
+                <div>
+                  <h3>{selectedCustomer.customer_name}</h3>
+                  <p>
+                    {selectedCustomer.assigned_to_name || 'Unassigned'}
+                    {selectedCustomer.customer_type === 'cash' ? ', cash customer' : `, ${selectedCustomer.credit_days || '—'} day credit`}
+                    {selectedCustomer.flagged && ` · ${selectedCustomer.flagged_reason}`}
+                  </p>
+                </div>
+                <button className="glass circle" onClick={closeSheet} aria-label="Close"><Icon.close /></button>
               </div>
-              <button className="glass circle" onClick={closeSheet} aria-label="Close"><Icon.close /></button>
             </div>
 
             {custDetailLoading ? (
