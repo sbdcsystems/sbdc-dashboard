@@ -9,16 +9,19 @@ button{font:inherit;color:inherit;letter-spacing:inherit;background:none;border:
 button:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:10px}
 svg{display:block}
 
-/* ---------- Ambient light behind the glass ---------- */
+/* ---------- Ambient light behind the glass ----------
+   Was 4 absolutely-positioned elements with filter:blur(80px) — a huge,
+   continuously-animated blur over most of the viewport is one of the more
+   expensive things a mobile GPU can be asked to composite every frame.
+   radial-gradient() already fades to transparent on its own, so dropping the
+   blur and the animation keeps the same soft, static color wash at a fraction
+   of the paint cost. */
 .ambient{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;background:var(--bg)}
-.ambient i{position:absolute;border-radius:50%;filter:blur(80px)}
-.ambient .p1{width:70vmax;height:70vmax;left:-25vmax;top:-20vmax;background:radial-gradient(closest-side,var(--pool1),transparent);animation:amb1 60s ease-in-out infinite alternate}
-.ambient .p2{width:65vmax;height:65vmax;right:-28vmax;top:18vh;background:radial-gradient(closest-side,var(--pool2),transparent);animation:amb2 70s ease-in-out infinite alternate}
-.ambient .p3{width:60vmax;height:60vmax;left:-15vmax;bottom:-25vmax;background:radial-gradient(closest-side,var(--pool3),transparent);animation:amb2 80s ease-in-out infinite alternate-reverse}
-.ambient .p4{width:45vmax;height:45vmax;right:-10vmax;bottom:-12vmax;background:radial-gradient(closest-side,var(--pool4),transparent);animation:amb1 75s ease-in-out infinite alternate-reverse}
-@keyframes amb1{to{transform:translate(8vmax,6vmax)}}
-@keyframes amb2{to{transform:translate(-7vmax,-5vmax)}}
-@media (prefers-reduced-motion: reduce){.ambient i{animation:none}}
+.ambient i{position:absolute;border-radius:50%}
+.ambient .p1{width:70vmax;height:70vmax;left:-25vmax;top:-20vmax;background:radial-gradient(closest-side,var(--pool1),transparent)}
+.ambient .p2{width:65vmax;height:65vmax;right:-28vmax;top:18vh;background:radial-gradient(closest-side,var(--pool2),transparent)}
+.ambient .p3{width:60vmax;height:60vmax;left:-15vmax;bottom:-25vmax;background:radial-gradient(closest-side,var(--pool3),transparent)}
+.ambient .p4{width:45vmax;height:45vmax;right:-10vmax;bottom:-12vmax;background:radial-gradient(closest-side,var(--pool4),transparent)}
 .app{position:relative;z-index:1}
 
 /* ---------- Liquid glass surface (nav, tabbar, circular buttons) ---------- */
@@ -42,7 +45,11 @@ svg{display:block}
 .circle svg{width:18px;height:18px;position:relative;z-index:2}
 
 /* ---------- Scroll edge fade ---------- */
-.edge-top,.edge-bottom{position:fixed;left:0;right:0;z-index:20;pointer-events:none;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+/* Plain gradients now — no backdrop-filter behind them — since a blurred
+   strip pinned across the full viewport width was one more expensive
+   compositing layer on every scroll frame, for a fade whose gradient already
+   does the visual work on its own. */
+.edge-top,.edge-bottom{position:fixed;left:0;right:0;z-index:20;pointer-events:none}
 .edge-top{top:0;height:58px;background:linear-gradient(var(--edge),transparent);-webkit-mask-image:linear-gradient(#000 45%,transparent);mask-image:linear-gradient(#000 45%,transparent)}
 .edge-bottom{bottom:0;height:90px;background:linear-gradient(transparent,var(--edge));-webkit-mask-image:linear-gradient(transparent,#000 55%);mask-image:linear-gradient(transparent,#000 55%)}
 
@@ -82,11 +89,17 @@ svg{display:block}
 .sh button{color:var(--blue);font-size:14px}
 .sf{font-size:12px;line-height:16px;color:var(--label2);padding:7px 2px 0;margin:0}
 
-/* ---------- Cards (frosted "mat" glass) ---------- */
-.card,.list,.notice{position:relative;background:var(--mat);-webkit-backdrop-filter:blur(30px) saturate(170%);backdrop-filter:blur(30px) saturate(170%);box-shadow:var(--mat-shadow),inset 0 1px 0 var(--mat-rim2)}
+/* ---------- Cards (frosted "mat" glass) ----------
+   Was backdrop-filter:blur(30px). These are the most numerous glass surfaces
+   on the page (every card, every list, on both tabs), so blurring each one
+   individually was the single biggest compositing cost outside the sheet
+   itself. Faked instead with the same translucent fill this already had,
+   plus the existing rim (::after) and shadow, which is what actually reads
+   as "glass" at a glance — no live blur-behind-content underneath. */
+.card,.list,.notice{position:relative;background:var(--mat);box-shadow:var(--mat-shadow),inset 0 1px 0 var(--mat-rim2)}
 .card::after,.list::after,.notice::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;pointer-events:none;z-index:1;background:linear-gradient(160deg,var(--mat-rim),transparent 32%,transparent 70%,var(--mat-rim2));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0)}
 .card{border-radius:22px;padding:15px 16px}
-@media (prefers-reduced-transparency: reduce){.card,.list,.notice{background:var(--cell);-webkit-backdrop-filter:none;backdrop-filter:none}}
+@media (prefers-reduced-transparency: reduce){.card,.list,.notice{background:var(--cell)}}
 
 .card--red{background:color-mix(in srgb, var(--red) 8%, var(--mat))}
 .card--flagged{background:color-mix(in srgb, var(--red) 8%, var(--mat))}
@@ -194,7 +207,12 @@ button.item:active{background:var(--fill)}
 /* ---------- Sheet ---------- */
 .scrim{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.28);animation:fade .2s ease}
 .scrim[hidden],.sheet[hidden]{display:none}
-.sheet{position:fixed;z-index:60;left:0;right:0;bottom:0;margin:0 auto;max-width:520px;max-height:calc(88vh - env(safe-area-inset-top,0px));overflow:auto;background:var(--mat-strong);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);box-shadow:inset 0 1px 0 var(--mat-rim);border-radius:28px 28px 0 0;padding:8px 16px calc(env(safe-area-inset-bottom,0px) + 22px);animation:up .3s cubic-bezier(.2,.9,.25,1)}
+/* Real backdrop-filter kept here (and on .glass for the nav/tab bar) — this
+   is one of the few surfaces where the blur matters visually and, unlike the
+   cards, only one of these is ever on screen at a time. Radius cut from 40px
+   to 20px: still reads as glass, materially cheaper to composite over the
+   sheet's large, frequently-open area. */
+.sheet{position:fixed;z-index:60;left:0;right:0;bottom:0;margin:0 auto;max-width:520px;max-height:calc(88vh - env(safe-area-inset-top,0px));overflow:auto;background:var(--mat-strong);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);box-shadow:inset 0 1px 0 var(--mat-rim);border-radius:28px 28px 0 0;padding:8px 16px calc(env(safe-area-inset-bottom,0px) + 22px);animation:up .3s cubic-bezier(.2,.9,.25,1)}
 .sheet-drag-handle{touch-action:none}
 .grab{width:34px;height:5px;border-radius:3px;background:var(--label3);margin:0 auto 8px}
 .shead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:4px 4px 12px}

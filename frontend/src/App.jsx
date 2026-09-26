@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useMemo } from 'react'
+import { useEffect, useState, useRef, useMemo, useCallback, memo } from 'react'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid,
@@ -308,6 +308,406 @@ const Icon = {
   chev:   () => <svg className="chev" viewBox="0 0 8 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m1 1 6 6-6 6"/></svg>,
 }
 
+// ── Customers list — windowed + memoized ────────────────────────────────────
+// Was rendering all ~1,100 rows unconditionally (just CSS `hidden` when the
+// Overview tab was active), which meant React reconciled ~1,100 DOM nodes on
+// every render of the whole app — including a sheet close, which has nothing
+// to do with this list. React.memo means an unrelated parent re-render (e.g.
+// selectedCustomer changing) skips this component entirely as long as
+// `customers`/`highlightedId`/`onOpen` haven't changed; the windowing on top
+// of that caps how much ever needs to mount even when it does re-render.
+const CUSTOMERS_PAGE_SIZE = 50
+
+const CustomersList = memo(function CustomersList({ customers, highlightedId, onOpen }) {
+  const [visibleCount, setVisibleCount] = useState(CUSTOMERS_PAGE_SIZE)
+  const sentinelRef = useRef(null)
+
+  // Reset the window when the filtered set changes; if the row we're meant to
+  // scroll to (jumped here from search) sits beyond the default window,
+  // expand far enough up front to include it.
+  useEffect(() => {
+    if (highlightedId) {
+      const idx = customers.findIndex(c => c.id === highlightedId)
+      if (idx >= 0) { setVisibleCount(Math.max(CUSTOMERS_PAGE_SIZE, idx + CUSTOMERS_PAGE_SIZE)); return }
+    }
+    setVisibleCount(CUSTOMERS_PAGE_SIZE)
+  }, [customers, highlightedId])
+
+  useEffect(() => {
+    const el = sentinelRef.current
+    if (!el) return
+    const io = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting) {
+        setVisibleCount(v => Math.min(v + CUSTOMERS_PAGE_SIZE, customers.length))
+      }
+    }, { rootMargin: '600px' })
+    io.observe(el)
+    return () => io.disconnect()
+  }, [customers.length])
+
+  if (customers.length === 0) {
+    return <div className="empty">No customers match your search.</div>
+  }
+
+  const visible = customers.slice(0, visibleCount)
+
+  return (
+    <div className="list">
+      {visible.map(c => (
+        <button
+          className={'item' + (c.id === highlightedId ? ' item--flash' : '')}
+          key={c.id}
+          onClick={() => onOpen(c)}
+          ref={c.id === highlightedId ? el => el && el.scrollIntoView({ behavior: 'smooth', block: 'center' }) : null}
+        >
+          <span className="av" style={{ background: c.flagged ? 'var(--red)' : 'var(--indigo)' }}>{c.customer_name[0].toUpperCase()}</span>
+          <span className="body">
+            <div className="t1">{c.customer_name}</div>
+            <div className="t2">
+              {c.assigned_to_name || 'Unassigned'}, {c.customer_type === 'cash' ? 'cash' : `${c.credit_days || '—'} day credit`}
+              {c.flagged ? ` · ${c.flagged_reason}` : ''}
+            </div>
+          </span>
+          <span className="val"><div className="v">{c.present_pending !== 0 ? formatINR(c.present_pending) : '—'}</div></span>
+          <Icon.chev />
+        </button>
+      ))}
+      {visibleCount < customers.length && <div ref={sentinelRef} aria-hidden="true" />}
+    </div>
+  )
+})
+
+// ── Overview page — memoized ─────────────────────────────────────────────────
+// Every prop below is either a primitive (compared by value) or already
+// wrapped in useMemo/useCallback in App, so React.memo's shallow comparison
+// actually holds across an unrelated re-render (e.g. opening/closing the
+// customer sheet) and this whole tree — hero card, both list-heavy cards,
+// two Recharts charts, staff/top-buyers/flagged lists — is skipped entirely
+// rather than being re-rendered and reconciled for nothing.
+const OverviewPage = memo(function OverviewPage({
+  summary, presentRatio, agingTotal,
+  salesCardPeriod, salesPickerOpen, salesCustomDate, salesCardLoading, salesDisplayData, salesHasDetail, visibleSalesItems, sortedSalesItems, showAllSales,
+  collCardPeriod, collPickerOpen, collCustomDate, collCardLoading, collDisplayData, collectionsHasDetail, sortedCollectionItems,
+  lastCollectionDate, collectionsStale,
+  staffSummary, maxStaffPending,
+  salesChartPeriod, hasSalesHistory, chartData, periodTotal, periodCount, chartPalette,
+  topCustomers, flagged,
+  staffById, staffByName, customersById, customerByName,
+  onSalesPeriod, onSalesCustomDate, onToggleSalesPicker, onToggleShowAllSales,
+  onCollPeriod, onCollCustomDate, onToggleCollPicker,
+  onGoToStaff, onSalesChartPeriod, onOpenCustomer,
+}) {
+  if (!summary) return null
+  return (
+    <>
+      <div className="lt">
+        <p>{new Date(TODAY + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
+        <h1>Summary</h1>
+      </div>
+
+      <div className="stack">
+        {/* Hero — money owed, with present/archived split folded in */}
+        <section className="card hero">
+          <div className="mhead">
+            <span className="mlabel" style={{ color: 'var(--green)' }}><Icon.rupee />Money owed to you</span>
+          </div>
+          <div className="mval"><HeroFigure amount={summary.recentTotal} /></div>
+          <div className="exact"><b>{formatINR(summary.recentTotal)}</b> from {summary.recentCount} active customers</div>
+          <div className="capsule" aria-hidden="true">
+            <i style={{ width: `${presentRatio}%`, background: 'var(--green)' }}></i>
+            <i style={{ width: `${100 - presentRatio}%`, background: 'var(--fill2)' }}></i>
+          </div>
+          <div className="legend">
+            <span><i className="dot" style={{ background: 'var(--green)' }}></i>Present <b>{formatCompact(summary.recentTotal)}</b></span>
+            <span><i className="dot" style={{ background: 'var(--fill2)' }}></i>Older than a year <b>{formatCompact(summary.staleTotal)}</b></span>
+          </div>
+        </section>
+
+        {/* Today's Sales */}
+        <section className="card">
+          <div className="mhead">
+            <span className="mlabel" style={{ color: 'var(--orange)' }}><Icon.sold />Sold</span>
+          </div>
+          <div className="seg-row">
+            <div className="seg" role="group" aria-label="Sales period">
+              {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Week'], ['this_month', 'Month']].map(([p, lbl]) => (
+                <button key={p} aria-pressed={salesCardPeriod === p} onClick={() => onSalesPeriod(p)}>{lbl}</button>
+              ))}
+            </div>
+            <button className="seg-date" onClick={() => onToggleSalesPicker(v => !v)}>
+              {salesCardPeriod === 'custom' && salesCustomDate
+                ? new Date(salesCustomDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+                : '…'}
+            </button>
+          </div>
+          {salesPickerOpen && (
+            <input type="date" className="seg-date" style={{ width: '100%', marginTop: 6 }} value={salesCustomDate} max={TODAY} onChange={e => onSalesCustomDate(e.target.value)} />
+          )}
+
+          {salesCardLoading ? (
+            <div className="card-skeleton"><div className="skeleton skeleton--figure" /><div className="skeleton skeleton--line" /></div>
+          ) : (
+            <div key={salesCardPeriod + salesCustomDate} className="card-fade">
+              {salesDisplayData ? (
+                <>
+                  <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(salesDisplayData.total_amount)}</span></div>
+                  <p className="msub">
+                    <strong>{salesDisplayData.invoice_count}</strong>{' '}
+                    {salesDisplayData.invoice_count === 1 ? 'invoice' : 'invoices'}
+                    {['today', 'yesterday', 'custom'].includes(salesCardPeriod) && salesDisplayData.synced_at && (
+                      <> · synced {new Date(salesDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</>
+                    )}
+                  </p>
+                  {salesHasDetail && (
+                    <div className="list plain" style={{ marginTop: 12 }}>
+                      {visibleSalesItems.map((item, idx) => {
+                        const cid      = item.customer_id
+                        const nameKey  = item.customer_name?.trim().toLowerCase()
+                        const staff    = (cid != null ? staffById[cid]  : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
+                        const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
+                        return (
+                          <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
+                            <span className="body">
+                              <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => onOpenCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
+                              <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
+                            </span>
+                            <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
+                          </div>
+                        )
+                      })}
+                      {sortedSalesItems.length > 10 && (
+                        <button className="sf link" style={{ padding: '10px 0 0' }} onClick={() => onToggleShowAllSales(v => !v)}>
+                          {showAllSales ? 'Show top 10' : `Show all ${sortedSalesItems.length} invoices`}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {!salesHasDetail && <p className="msub">Per-invoice breakdown not available from this Tally export</p>}
+                </>
+              ) : (
+                <p className="msub">
+                  {salesCardPeriod === 'today' ? "No data yet — sync hasn't run today" : `No data for ${_periodLabel(salesCardPeriod, salesCustomDate)}`}
+                </p>
+              )}
+            </div>
+          )}
+        </section>
+
+        {/* Collections */}
+        <section className="card">
+          <div className="mhead">
+            <span className="mlabel" style={{ color: 'var(--blue)' }}><Icon.received />Received</span>
+          </div>
+          <div className="seg-row">
+            <div className="seg" role="group" aria-label="Collections period">
+              {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Week'], ['this_month', 'Month']].map(([p, lbl]) => (
+                <button key={p} aria-pressed={collCardPeriod === p} onClick={() => onCollPeriod(p)}>{lbl}</button>
+              ))}
+            </div>
+            <button className="seg-date" onClick={() => onToggleCollPicker(v => !v)}>
+              {collCardPeriod === 'custom' && collCustomDate
+                ? new Date(collCustomDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+                : '…'}
+            </button>
+          </div>
+          {collPickerOpen && (
+            <input type="date" className="seg-date" style={{ width: '100%', marginTop: 6 }} value={collCustomDate} max={TODAY} onChange={e => onCollCustomDate(e.target.value)} />
+          )}
+
+          {collCardLoading ? (
+            <div className="card-skeleton"><div className="skeleton skeleton--figure" /><div className="skeleton skeleton--line" /></div>
+          ) : (
+            <div key={collCardPeriod + collCustomDate} className="card-fade">
+              {collDisplayData ? (
+                collDisplayData.invoice_count === 0 ? (
+                  <p className="msub" style={{ marginTop: 12 }}>
+                    {collCardPeriod === 'today'
+                      ? 'Not entered yet. Payments are usually entered a day or two later.'
+                      : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
+                  </p>
+                ) : (
+                  <>
+                    <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(collDisplayData.total_amount)}</span></div>
+                    <p className="msub">
+                      <strong>{collDisplayData.invoice_count}</strong>{' '}
+                      {collDisplayData.invoice_count === 1 ? 'receipt' : 'receipts'}
+                      {['today', 'yesterday', 'custom'].includes(collCardPeriod) && collDisplayData.synced_at && (
+                        <> · synced {new Date(collDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</>
+                      )}
+                    </p>
+                    {collectionsHasDetail ? (
+                      <div className="list plain" style={{ marginTop: 12 }}>
+                        {sortedCollectionItems.map((item, idx) => {
+                          const cid     = item.customer_id
+                          const nameKey = item.customer_name?.trim().toLowerCase()
+                          const staff   = (cid != null ? staffById[cid] : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
+                          const cust    = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
+                          return (
+                            <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
+                              <span className="body">
+                                <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => onOpenCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
+                                <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
+                              </span>
+                              <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : (
+                      <p className="msub">Per-receipt breakdown not available from this Tally export</p>
+                    )}
+                  </>
+                )
+              ) : (
+                <p className="msub" style={{ marginTop: 12 }}>
+                  {collCardPeriod === 'today' ? "No collections yet today — sync hasn't run" : `No data for ${_periodLabel(collCardPeriod, collCustomDate)}`}
+                </p>
+              )}
+            </div>
+          )}
+        </section>
+
+        {/* Collections status — calm by default; the office normally batch-enters
+            payments 1-3 days late, so this must not read as an alarm on an
+            ordinary day. Only turns orange once it's genuinely unusual. */}
+        {lastCollectionDate && (
+          <p className="sf" style={{ padding: '0 2px', color: collectionsStale ? 'var(--orange)' : undefined }}>
+            Payments entered in Tally up to{' '}
+            {new Date(lastCollectionDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
+            {collectionsStale && ' — nothing new in a while, worth checking'}
+          </p>
+        )}
+
+        {/* By staff */}
+        <div>
+          <div className="sh"><h2>By staff</h2></div>
+          <div className="list">
+            {staffSummary.map(s => {
+              const color  = STAFF_COLORS[s.staff_name] || NEUTRAL_COLOR
+              const barPct = (s.total_pending / maxStaffPending) * 100
+              return (
+                <button className="item" key={s.staff_name} onClick={() => onGoToStaff(s.staff_name)}>
+                  <span className="av" style={{ background: color.bg, color: color.fg }}>{getInitials(s.staff_name)}</span>
+                  <span className="body">
+                    <div className="t1">{s.staff_name}</div>
+                    <div className="t2">{s.customer_count} active customers</div>
+                    <div className="staff-bar-track" style={{ height: 4, background: 'var(--fill)', borderRadius: 2, overflow: 'hidden', marginTop: 5 }}>
+                      <div style={{ width: `${barPct}%`, height: '100%', background: color.bg, borderRadius: 2 }} />
+                    </div>
+                  </span>
+                  <span className="val"><div className="v">{formatCompact(s.total_pending)}</div></span>
+                  <Icon.chev />
+                </button>
+              )
+            })}
+          </div>
+          <p className="sf">Tap a name to see their customers.</p>
+        </div>
+
+        {/* Sales chart */}
+        <div>
+          <div className="sh"><h2>Sales</h2></div>
+          <section className="card">
+            <div className="chead">
+              <div>
+                <div className="clabel">
+                  Total, {salesChartPeriod === 'fy' ? 'this FY' : salesChartPeriod === 'last_month' ? 'last month' : 'this month'}
+                </div>
+                <div className="mval" style={{ marginTop: 4 }}><span className="big">{formatINR(periodTotal)}</span></div>
+                <div className="msub">{periodCount} {periodCount === 1 ? 'invoice' : 'invoices'}</div>
+              </div>
+              <div className="seg small" role="group" aria-label="Chart range">
+                {[['this_month', 'Month'], ['last_month', 'Last'], ['fy', 'FY']].map(([p, lbl]) => (
+                  <button key={p} aria-pressed={salesChartPeriod === p} onClick={() => onSalesChartPeriod(p)}>{lbl}</button>
+                ))}
+              </div>
+            </div>
+            {hasSalesHistory ? (
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={140}>
+                  <BarChart data={chartData} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
+                    <CartesianGrid vertical={false} stroke={chartPalette.grid} />
+                    <XAxis dataKey="date" tick={{ fill: chartPalette.text, fontSize: 11 }} axisLine={{ stroke: chartPalette.grid }} tickLine={false} interval={salesChartPeriod === 'fy' ? 0 : 'preserveStartEnd'} />
+                    <YAxis hide />
+                    <Tooltip cursor={{ fill: 'rgba(48,176,199,0.08)' }} formatter={v => [formatINR(v), 'Sales']} contentStyle={{ background: chartPalette.tooltipBg, border: `1px solid ${chartPalette.tooltipBorder}`, borderRadius: 10, fontSize: 12 }} />
+                    <Bar dataKey="total" fill={chartPalette.bar} radius={[3, 3, 0, 0]} maxBarSize={salesChartPeriod === 'fy' ? 60 : 32} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            ) : (
+              <p className="msub">No data yet — sync hasn't run</p>
+            )}
+          </section>
+        </div>
+
+        {/* Age of dues */}
+        <div>
+          <div className="sh"><h2>Age of dues</h2></div>
+          <section className="card">
+            <div className="capsule" style={{ marginTop: 0, height: 12, borderRadius: 6 }}>
+              {summary.bucketChartData.map((b, i) => (
+                <i key={b.bucket} style={{ width: agingTotal > 0 ? `${(b.total / agingTotal) * 100}%` : 0, background: BUCKET_COLORS[i] || BUCKET_COLORS[0] }} />
+              ))}
+            </div>
+            <div className="list plain" style={{ margin: '10px -16px -15px' }}>
+              {summary.bucketChartData.map((b, i) => (
+                <div className="item" key={b.bucket}>
+                  <span className="dot" style={{ background: BUCKET_COLORS[i] || BUCKET_COLORS[0] }}></span>
+                  <span className="body"><div className="t1">{BUCKET_LABELS[b.bucket] || b.bucket}</div></span>
+                  <span className="val">
+                    <div className="v">{formatCompact(b.total)}</div>
+                    <div className="s">{agingTotal > 0 ? Math.round(b.total / agingTotal * 100) : 0}%</div>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        {/* Top buyers */}
+        {topCustomers.length > 0 && (
+          <div>
+            <div className="sh"><h2>Top buyers {salesChartPeriod === 'fy' ? 'this FY' : salesChartPeriod === 'last_month' ? 'last month' : 'this month'}</h2></div>
+            <div className="list">
+              {topCustomers.map((c, i) => {
+                const cust = customerByName[c.name.trim().toLowerCase()]
+                return (
+                  <div className={'item' + (cust ? ' link' : '')} key={i} onClick={cust ? () => onOpenCustomer(cust) : undefined}>
+                    <span className="av" style={{ background: 'var(--teal)' }}>{i + 1}</span>
+                    <span className="body"><div className="t1">{c.name}</div></span>
+                    <span className="val"><div className="v">{formatCompact(c.total)}</div></span>
+                    {cust && <Icon.chev />}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Flagged */}
+        {flagged.length > 0 && (
+          <div>
+            <div className="sh"><h2>Flagged</h2></div>
+            <div className="list card--flagged">
+              {flagged.map(c => {
+                const cust = customersById[c.id]
+                return (
+                  <div className={'item' + (cust ? ' link' : '')} key={c.id} onClick={cust ? () => onOpenCustomer(cust) : undefined}>
+                    <span className="av" style={{ background: 'var(--red)' }}>!</span>
+                    <span className="body"><div className="t1">{c.customer_name}</div><div className="t2">{c.flagged_reason}</div></span>
+                    <span className="val"><div className="v" style={{ color: 'var(--red)' }}>{formatINR(c.total_pending)}</div></span>
+                  </div>
+                )
+              })}
+            </div>
+            <p className="sf">Flagged accounts are not included in money owed.</p>
+          </div>
+        )}
+      </div>
+    </>
+  )
+})
+
 // ── App ──────────────────────────────────────────────────────────────────────
 
 const _PW = import.meta.env.VITE_DASHBOARD_PASSWORD
@@ -549,39 +949,46 @@ export default function App() {
     load()
   }, [])
 
-  function goToStaff(name) {
+  const goToStaff = useCallback((name) => {
     setView('customers')
     setStaffFilter(name)
     setSearchQuery('')
-  }
+  }, [])
 
-  const staffFilteredCustomers = customers.filter(c => {
+  // Every one of these used to be a plain `const` recomputed on every render —
+  // including a render triggered by opening/closing the customer sheet, which
+  // has nothing to do with any of this data. Profiling a close under 6x CPU
+  // throttle showed these O(customers)/O(salesHistory) passes (up to ~1,100
+  // and several thousand rows respectively) re-running on every sheet toggle,
+  // on top of the Customers list's DOM reconciliation. useMemo means they only
+  // redo the work when their actual inputs change.
+  const staffFilteredCustomers = useMemo(() => customers.filter(c => {
     if (!staffFilter) return true
     if (staffFilter === 'Unassigned') return !c.assigned_to_name
     return c.assigned_to_name === staffFilter
-  })
+  }), [customers, staffFilter])
 
-  const filteredCustomers = staffFilteredCustomers.filter(c => {
+  const filteredCustomers = useMemo(() => staffFilteredCustomers.filter(c => {
     const q = searchQuery.trim().toLowerCase()
     if (!q) return true
     return (
       c.customer_name.toLowerCase().includes(q) ||
       (c.phone || '').includes(q)
     )
-  })
+  }), [staffFilteredCustomers, searchQuery])
 
-  const staffSubtotal = staffFilter ? {
+  const staffSubtotal = useMemo(() => staffFilter ? {
     count: staffFilteredCustomers.length,
     total: staffFilteredCustomers.reduce((sum, c) => sum + c.present_pending, 0),
-  } : null
+  } : null, [staffFilter, staffFilteredCustomers])
 
-  const maxStaffPending = staffSummary.length
+  const maxStaffPending = useMemo(() => staffSummary.length
     ? Math.max(...staffSummary.map(s => s.total_pending), 1)
-    : 1
+    : 1, [staffSummary])
 
-  const presentRatio = summary && (summary.recentTotal + summary.staleTotal) > 0
+  const presentRatio = useMemo(() => summary && (summary.recentTotal + summary.staleTotal) > 0
     ? (summary.recentTotal / (summary.recentTotal + summary.staleTotal)) * 100
-    : 50
+    : 50, [summary])
 
   // ── Sales history aggregates ────────────────────────────────────────────────
   const periodStart = salesChartPeriod === 'last_month' ? LAST_MONTH_START
@@ -589,43 +996,48 @@ export default function App() {
     : MONTH_START
   const periodEnd = salesChartPeriod === 'last_month' ? LAST_MONTH_END : TODAY
 
-  const periodSales = salesHistory.filter(s => s.sale_date >= periodStart && s.sale_date <= periodEnd)
-  const periodTotal = periodSales.reduce((sum, s) => sum + s.amount, 0)
+  const periodSales = useMemo(
+    () => salesHistory.filter(s => s.sale_date >= periodStart && s.sale_date <= periodEnd),
+    [salesHistory, periodStart, periodEnd]
+  )
+  const periodTotal = useMemo(() => periodSales.reduce((sum, s) => sum + s.amount, 0), [periodSales])
   const periodCount = periodSales.length
 
-  let chartData
-  if (salesChartPeriod === 'fy') {
-    const fyMonths = _fyMonthKeys(FY_START, TODAY)
-    const mmap = {}
-    salesHistory.forEach(s => { const m = s.sale_date.slice(0, 7); mmap[m] = (mmap[m] || 0) + s.amount })
-    chartData = fyMonths.map(({ key, label }) => ({ date: label, total: mmap[key] || 0 }))
-  } else {
+  const chartData = useMemo(() => {
+    if (salesChartPeriod === 'fy') {
+      const fyMonths = _fyMonthKeys(FY_START, TODAY)
+      const mmap = {}
+      salesHistory.forEach(s => { const m = s.sale_date.slice(0, 7); mmap[m] = (mmap[m] || 0) + s.amount })
+      return fyMonths.map(({ key, label }) => ({ date: label, total: mmap[key] || 0 }))
+    }
     const days = []
     let d = periodStart
     while (d <= periodEnd) { days.push(d); d = _addDaysISO(d, 1) }
     const dmap = {}
     periodSales.forEach(s => { dmap[s.sale_date] = (dmap[s.sale_date] || 0) + s.amount })
-    chartData = days.map(d => {
+    return days.map(d => {
       const [, mo, da] = d.split('-')
       return { date: `${Number(da)}/${Number(mo)}`, total: dmap[d] || 0 }
     })
-  }
+  }, [salesChartPeriod, salesHistory, periodSales, periodStart, periodEnd])
 
-  const topCustomerMap = {}
-  periodSales.forEach(s => {
-    const k = s.customer_name || 'Unknown'
-    topCustomerMap[k] = (topCustomerMap[k] || 0) + s.amount
-  })
-  const topCustomers   = Object.entries(topCustomerMap)
-    .sort((a, b) => b[1] - a[1]).slice(0, 5)
-    .map(([name, total]) => ({ name, total }))
+  const topCustomers = useMemo(() => {
+    const topCustomerMap = {}
+    periodSales.forEach(s => {
+      const k = s.customer_name || 'Unknown'
+      topCustomerMap[k] = (topCustomerMap[k] || 0) + s.amount
+    })
+    return Object.entries(topCustomerMap)
+      .sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([name, total]) => ({ name, total }))
+  }, [periodSales])
 
   // UUID-keyed maps (primary — no string matching, immune to name variations)
-  const staffById      = Object.fromEntries(customers.map(c => [c.id, c.assigned_to_name || 'Unassigned']))
-  const customersById  = Object.fromEntries(customers.map(c => [c.id, c]))
+  const staffById     = useMemo(() => Object.fromEntries(customers.map(c => [c.id, c.assigned_to_name || 'Unassigned'])), [customers])
+  const customersById = useMemo(() => Object.fromEntries(customers.map(c => [c.id, c])), [customers])
   // Name-keyed maps (fallback — for items synced before UUID enrichment was added)
-  const staffByName    = Object.fromEntries(customers.map(c => [c.customer_name.trim().toLowerCase(), c.assigned_to_name || 'Unassigned']))
-  const customerByName = Object.fromEntries(customers.map(c => [c.customer_name.trim().toLowerCase(), c]))
+  const staffByName    = useMemo(() => Object.fromEntries(customers.map(c => [c.customer_name.trim().toLowerCase(), c.assigned_to_name || 'Unassigned'])), [customers])
+  const customerByName = useMemo(() => Object.fromEntries(customers.map(c => [c.customer_name.trim().toLowerCase(), c])), [customers])
 
   // ── Global search ──────────────────────────────────────────────────────────
   const searchResults = useMemo(() => {
@@ -686,6 +1098,165 @@ export default function App() {
   const sheetDragStartY = useRef(null)
   const sheetDragging    = useRef(false)
 
+  // Handlers below are wrapped in useCallback (stable references across
+  // renders) and, along with every derived value above, now live entirely
+  // before the auth early-return — moved down from just above the login
+  // gate so useCallback/useMemo can be called unconditionally. They're
+  // passed as props into the now-memoized CustomersList/OverviewPage
+  // components below; without a stable reference, React.memo's prop
+  // comparison would fail every render and defeat the memoization.
+  const handleSalesPeriod = useCallback(async (period) => {
+    setSalesCardPeriod(period)
+    if (period !== 'custom') setSalesPickerOpen(false)
+    if (period === 'today') { setSalesCardRows(null); return }
+    const { from, to } = _cardRange(period)
+    setSalesCardLoading(true)
+    const { data } = await supabase.from('daily_sales').select('*').gte('sale_date', from).lte('sale_date', to)
+    setSalesCardRows(data || [])
+    setSalesCardLoading(false)
+  }, [])
+
+  const handleSalesCustomDate = useCallback(async (dateStr) => {
+    setSalesCustomDate(dateStr)
+    if (!dateStr) return
+    setSalesCardPeriod('custom')
+    setSalesCardLoading(true)
+    const { data } = await supabase.from('daily_sales').select('*').eq('sale_date', dateStr)
+    setSalesCardRows(data || [])
+    setSalesCardLoading(false)
+  }, [])
+
+  const handleCollPeriod = useCallback(async (period) => {
+    setCollCardPeriod(period)
+    if (period !== 'custom') setCollPickerOpen(false)
+    if (period === 'today') { setCollCardRows(null); return }
+    const { from, to } = _cardRange(period)
+    setCollCardLoading(true)
+    const { data } = await supabase.from('daily_collections').select('*').gte('sale_date', from).lte('sale_date', to)
+    setCollCardRows(data || [])
+    setCollCardLoading(false)
+  }, [])
+
+  const handleCollCustomDate = useCallback(async (dateStr) => {
+    setCollCustomDate(dateStr)
+    if (!dateStr) return
+    setCollCardPeriod('custom')
+    setCollCardLoading(true)
+    const { data } = await supabase.from('daily_collections').select('*').eq('sale_date', dateStr)
+    setCollCardRows(data || [])
+    setCollCardLoading(false)
+  }, [])
+
+  const handleSearchResult = useCallback((customer) => {
+    setGlobalSearch('')
+    setSearchOpen(false)
+    setView('customers')
+    setStaffFilter(null)
+    setSearchQuery('')
+    setHighlightedId(customer.id)
+  }, [])
+
+  // Customer detail is now a bottom sheet overlaid on whichever page is
+  // showing, rather than a third routed "view" — closing it just returns to
+  // whatever was already underneath, so there's no separate "back" state to
+  // track any more.
+  const openCustomer = useCallback(async (customer) => {
+    setSelectedCustomer(customer)
+    setCustDetail(null)
+    setCustDetailLoading(true)
+    const [{ data: bills }, history] = await Promise.all([
+      supabase.from('outstanding')
+        .select('invoice_date, invoice_ref, pending_amount, days_overdue, age_status, bucket')
+        .eq('customer_id', customer.id)
+        .order('invoice_date', { ascending: true }),
+      fetchCustHistory(customer.customer_name, customer.id),
+    ])
+    setCustDetail({ bills: bills || [], history })
+    setCustDetailLoading(false)
+  }, [])
+
+  // Closing the sheet must ONLY clear this local state — no refetch, and
+  // (thanks to the memoization above + CustomersList/OverviewPage being
+  // React.memo'd) no re-render of the Overview/Customers tree either.
+  const closeSheet = useCallback(() => {
+    setSelectedCustomer(null)
+    setCustDetail(null)
+  }, [])
+
+  function handleSheetDragStart(e) {
+    sheetDragStartY.current = e.touches[0].clientY
+    sheetDragging.current = true
+  }
+  function handleSheetDragMove(e) {
+    if (!sheetDragging.current || sheetDragStartY.current === null) return
+    const delta = e.touches[0].clientY - sheetDragStartY.current
+    if (delta > 0) setSheetDragY(delta)
+  }
+  function handleSheetDragEnd() {
+    if (!sheetDragging.current) return
+    sheetDragging.current = false
+    if (sheetDragY > 80) closeSheet()
+    setSheetDragY(0)
+    sheetDragStartY.current = null
+  }
+
+  const salesDisplayData = useMemo(() => salesCardRows !== null ? _mergeCardRows(salesCardRows) : todaySales, [salesCardRows, todaySales])
+  const collDisplayData  = useMemo(() => collCardRows  !== null ? _mergeCardRows(collCardRows)  : todayCollections, [collCardRows, todayCollections])
+
+  const sortedSalesItems      = useMemo(() => [...(salesDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount), [salesDisplayData])
+  const visibleSalesItems     = useMemo(() => showAllSales ? sortedSalesItems : sortedSalesItems.slice(0, 10), [showAllSales, sortedSalesItems])
+  const salesHasDetail        = useMemo(() => sortedSalesItems.some(i => i.customer_name || i.invoice_ref), [sortedSalesItems])
+  const sortedCollectionItems = useMemo(() => [...(collDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount), [collDisplayData])
+  const collectionsHasDetail  = useMemo(() => sortedCollectionItems.some(i => i.customer_name || i.invoice_ref), [sortedCollectionItems])
+
+  // ── Customer detail derived values ─────────────────────────────────────────
+  const {
+    cdBills, cdHistory, cdActiveBills, cdTotalPending, cdOldestBill,
+    cdFyTotal, cdAvgOrder, cdDaysSince, cdRating,
+  } = useMemo(() => {
+    const cdBills        = custDetail?.bills   ?? []
+    const cdHistory      = custDetail?.history ?? []
+    const cdActiveBills  = cdBills.filter(b => b.pending_amount > 0)
+    const cdTotalPending = cdActiveBills.reduce((s, b) => s + Number(b.pending_amount), 0)
+    const cdOldestBill   = cdActiveBills[0] ?? null
+    const cdFyTotal      = cdHistory.reduce((s, h) => s + Number(h.amount), 0)
+    const cdAvgOrder     = cdHistory.length > 0 ? cdFyTotal / cdHistory.length : 0
+    const cdLastPurchase = cdHistory[0]?.sale_date ?? null
+    const cdDaysSince    = cdLastPurchase
+      ? Math.floor((new Date(TODAY) - new Date(cdLastPurchase + 'T00:00:00')) / 86400000)
+      : null
+    const cdRating = custDetail ? computeRating(cdBills, cdHistory, fyMedian, FY_MONTHS_ELAPSED) : null
+    return { cdBills, cdHistory, cdActiveBills, cdTotalPending, cdOldestBill, cdFyTotal, cdAvgOrder, cdDaysSince, cdRating }
+  }, [custDetail, fyMedian])
+
+  // ── Collections status line — calm by default, orange only if stale ────────
+  // Was an alarm-style "No payments recorded since <date>" notice that fired
+  // after just 2 working days — but the office normally batch-enters
+  // payments 1-3 days late, so it was permanently, wrongly alarming on
+  // completely ordinary days. Now always shows the plain fact (latest date
+  // Tally has entries for) and only escalates to orange once it's genuinely
+  // unusual: 4+ working days with nothing new entered.
+  const workingDaysSinceLastPayment = lastCollectionDate ? _workingDaysSince(lastCollectionDate, TODAY) : null
+  const collectionsStale = workingDaysSinceLastPayment !== null && workingDaysSinceLastPayment >= 4
+
+  // ── "Last synced" header pill ───────────────────────────────────────────────
+  const lastSyncStale = lastSync
+    ? (now - new Date(lastSync.run_at).getTime() > 60 * 60 * 1000) && _isOfficeHoursIST()
+    : false
+
+  // ── Recharts palette (theme-aware — SVG attrs don't resolve CSS var()) ─────
+  const chartPalette = useMemo(() => resolvedDark
+    ? { grid: '#3A3A3C', text: 'rgba(235,235,245,.6)', tooltipBg: '#1C1C1E', tooltipBorder: '#3A3A3C', bar: '#40C8E0' }
+    : { grid: '#D8DBE6', text: 'rgba(60,60,67,.6)',   tooltipBg: '#fff',    tooltipBorder: '#D8DBE6', bar: '#30B0C7' }, [resolvedDark])
+
+  const agingTotal = useMemo(() => summary ? summary.bucketChartData.reduce((s, b) => s + b.total, 0) : 0, [summary])
+
+  const pageTitle = view === 'customers' ? 'Customers' : 'Summary'
+  const custCallHref = telHref(selectedCustomer?.phone)
+  const custWaHref   = waHref(selectedCustomer?.phone, cdTotalPending)
+
+  const applyTheme = useCallback((t) => { setTheme(t); setMenuOpen(false) }, [])
+
   // ── Auth gate — all hooks are above this, so early return is safe ──────────
 
   const handleLogin = e => {
@@ -722,148 +1293,6 @@ export default function App() {
     )
   }
 
-  async function handleSalesPeriod(period) {
-    setSalesCardPeriod(period)
-    if (period !== 'custom') setSalesPickerOpen(false)
-    if (period === 'today') { setSalesCardRows(null); return }
-    const { from, to } = _cardRange(period)
-    setSalesCardLoading(true)
-    const { data } = await supabase.from('daily_sales').select('*').gte('sale_date', from).lte('sale_date', to)
-    setSalesCardRows(data || [])
-    setSalesCardLoading(false)
-  }
-
-  async function handleSalesCustomDate(dateStr) {
-    setSalesCustomDate(dateStr)
-    if (!dateStr) return
-    setSalesCardPeriod('custom')
-    setSalesCardLoading(true)
-    const { data } = await supabase.from('daily_sales').select('*').eq('sale_date', dateStr)
-    setSalesCardRows(data || [])
-    setSalesCardLoading(false)
-  }
-
-  async function handleCollPeriod(period) {
-    setCollCardPeriod(period)
-    if (period !== 'custom') setCollPickerOpen(false)
-    if (period === 'today') { setCollCardRows(null); return }
-    const { from, to } = _cardRange(period)
-    setCollCardLoading(true)
-    const { data } = await supabase.from('daily_collections').select('*').gte('sale_date', from).lte('sale_date', to)
-    setCollCardRows(data || [])
-    setCollCardLoading(false)
-  }
-
-  async function handleCollCustomDate(dateStr) {
-    setCollCustomDate(dateStr)
-    if (!dateStr) return
-    setCollCardPeriod('custom')
-    setCollCardLoading(true)
-    const { data } = await supabase.from('daily_collections').select('*').eq('sale_date', dateStr)
-    setCollCardRows(data || [])
-    setCollCardLoading(false)
-  }
-
-  function handleSearchResult(customer) {
-    setGlobalSearch('')
-    setSearchOpen(false)
-    setView('customers')
-    setStaffFilter(null)
-    setSearchQuery('')
-    setHighlightedId(customer.id)
-  }
-
-  // Customer detail is now a bottom sheet overlaid on whichever page is
-  // showing, rather than a third routed "view" — closing it just returns to
-  // whatever was already underneath, so there's no separate "back" state to
-  // track any more.
-  async function openCustomer(customer) {
-    setSelectedCustomer(customer)
-    setCustDetail(null)
-    setCustDetailLoading(true)
-    const [{ data: bills }, history] = await Promise.all([
-      supabase.from('outstanding')
-        .select('invoice_date, invoice_ref, pending_amount, days_overdue, age_status, bucket')
-        .eq('customer_id', customer.id)
-        .order('invoice_date', { ascending: true }),
-      fetchCustHistory(customer.customer_name, customer.id),
-    ])
-    setCustDetail({ bills: bills || [], history })
-    setCustDetailLoading(false)
-  }
-  function closeSheet() {
-    setSelectedCustomer(null)
-    setCustDetail(null)
-  }
-
-  function handleSheetDragStart(e) {
-    sheetDragStartY.current = e.touches[0].clientY
-    sheetDragging.current = true
-  }
-  function handleSheetDragMove(e) {
-    if (!sheetDragging.current || sheetDragStartY.current === null) return
-    const delta = e.touches[0].clientY - sheetDragStartY.current
-    if (delta > 0) setSheetDragY(delta)
-  }
-  function handleSheetDragEnd() {
-    if (!sheetDragging.current) return
-    sheetDragging.current = false
-    if (sheetDragY > 80) closeSheet()
-    setSheetDragY(0)
-    sheetDragStartY.current = null
-  }
-
-  const salesDisplayData = salesCardRows !== null ? _mergeCardRows(salesCardRows) : todaySales
-  const collDisplayData  = collCardRows  !== null ? _mergeCardRows(collCardRows)  : todayCollections
-
-  const sortedSalesItems       = [...(salesDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount)
-  const visibleSalesItems      = showAllSales ? sortedSalesItems : sortedSalesItems.slice(0, 10)
-  const salesHasDetail         = sortedSalesItems.some(i => i.customer_name || i.invoice_ref)
-  const sortedCollectionItems  = [...(collDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount)
-  const collectionsHasDetail   = sortedCollectionItems.some(i => i.customer_name || i.invoice_ref)
-
-  // ── Customer detail derived values ─────────────────────────────────────────
-  const cdBills         = custDetail?.bills   ?? []
-  const cdHistory       = custDetail?.history ?? []
-  const cdActiveBills   = cdBills.filter(b => b.pending_amount > 0)
-  const cdTotalPending  = cdActiveBills.reduce((s, b) => s + Number(b.pending_amount), 0)
-  const cdOldestBill    = cdActiveBills[0] ?? null
-  const cdFyTotal       = cdHistory.reduce((s, h) => s + Number(h.amount), 0)
-  const cdAvgOrder      = cdHistory.length > 0 ? cdFyTotal / cdHistory.length : 0
-  const cdLastPurchase  = cdHistory[0]?.sale_date ?? null
-  const cdDaysSince     = cdLastPurchase
-    ? Math.floor((new Date(TODAY) - new Date(cdLastPurchase + 'T00:00:00')) / 86400000)
-    : null
-  const cdRating        = custDetail ? computeRating(cdBills, cdHistory, fyMedian, FY_MONTHS_ELAPSED) : null
-
-  // ── Collections status line — calm by default, orange only if stale ────────
-  // Was an alarm-style "No payments recorded since <date>" notice that fired
-  // after just 2 working days — but the office normally batch-enters
-  // payments 1-3 days late, so it was permanently, wrongly alarming on
-  // completely ordinary days. Now always shows the plain fact (latest date
-  // Tally has entries for) and only escalates to orange once it's genuinely
-  // unusual: 4+ working days with nothing new entered.
-  const workingDaysSinceLastPayment = lastCollectionDate ? _workingDaysSince(lastCollectionDate, TODAY) : null
-  const collectionsStale = workingDaysSinceLastPayment !== null && workingDaysSinceLastPayment >= 4
-
-  // ── "Last synced" header pill ───────────────────────────────────────────────
-  const lastSyncStale = lastSync
-    ? (now - new Date(lastSync.run_at).getTime() > 60 * 60 * 1000) && _isOfficeHoursIST()
-    : false
-
-  // ── Recharts palette (theme-aware — SVG attrs don't resolve CSS var()) ─────
-  const chartPalette = resolvedDark
-    ? { grid: '#3A3A3C', text: 'rgba(235,235,245,.6)', tooltipBg: '#1C1C1E', tooltipBorder: '#3A3A3C', bar: '#40C8E0' }
-    : { grid: '#D8DBE6', text: 'rgba(60,60,67,.6)',   tooltipBg: '#fff',    tooltipBorder: '#D8DBE6', bar: '#30B0C7' }
-
-  const agingTotal = summary ? summary.bucketChartData.reduce((s, b) => s + b.total, 0) : 0
-
-  const pageTitle = view === 'customers' ? 'Customers' : 'Summary'
-  const custCallHref = telHref(selectedCustomer?.phone)
-  const custWaHref   = waHref(selectedCustomer?.phone, cdTotalPending)
-
-  function applyTheme(t) { setTheme(t); setMenuOpen(false) }
-
   return (
     <div className="app">
       <div className="ambient" aria-hidden="true"><i className="p1"></i><i className="p2"></i><i className="p3"></i><i className="p4"></i></div>
@@ -898,314 +1327,25 @@ export default function App() {
 
       {/* ── Overview / Summary page ── */}
       <main className="page" hidden={loading || !!error || view !== 'overview' || !summary}>
-        {summary && (
-          <>
-            <div className="lt">
-              <p>{new Date(TODAY + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
-              <h1>Summary</h1>
-            </div>
-
-            <div className="stack">
-              {/* Hero — money owed, with present/archived split folded in */}
-              <section className="card hero">
-                <div className="mhead">
-                  <span className="mlabel" style={{ color: 'var(--green)' }}><Icon.rupee />Money owed to you</span>
-                </div>
-                <div className="mval"><HeroFigure amount={summary.recentTotal} /></div>
-                <div className="exact"><b>{formatINR(summary.recentTotal)}</b> from {summary.recentCount} active customers</div>
-                <div className="capsule" aria-hidden="true">
-                  <i style={{ width: `${presentRatio}%`, background: 'var(--green)' }}></i>
-                  <i style={{ width: `${100 - presentRatio}%`, background: 'var(--fill2)' }}></i>
-                </div>
-                <div className="legend">
-                  <span><i className="dot" style={{ background: 'var(--green)' }}></i>Present <b>{formatCompact(summary.recentTotal)}</b></span>
-                  <span><i className="dot" style={{ background: 'var(--fill2)' }}></i>Older than a year <b>{formatCompact(summary.staleTotal)}</b></span>
-                </div>
-              </section>
-
-              {/* Today's Sales */}
-              <section className="card">
-                <div className="mhead">
-                  <span className="mlabel" style={{ color: 'var(--orange)' }}><Icon.sold />Sold</span>
-                </div>
-                <div className="seg-row">
-                  <div className="seg" role="group" aria-label="Sales period">
-                    {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Week'], ['this_month', 'Month']].map(([p, lbl]) => (
-                      <button key={p} aria-pressed={salesCardPeriod === p} onClick={() => handleSalesPeriod(p)}>{lbl}</button>
-                    ))}
-                  </div>
-                  <button className="seg-date" onClick={() => setSalesPickerOpen(v => !v)}>
-                    {salesCardPeriod === 'custom' && salesCustomDate
-                      ? new Date(salesCustomDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
-                      : '…'}
-                  </button>
-                </div>
-                {salesPickerOpen && (
-                  <input type="date" className="seg-date" style={{ width: '100%', marginTop: 6 }} value={salesCustomDate} max={TODAY} onChange={e => handleSalesCustomDate(e.target.value)} />
-                )}
-
-                {salesCardLoading ? (
-                  <div className="card-skeleton"><div className="skeleton skeleton--figure" /><div className="skeleton skeleton--line" /></div>
-                ) : (
-                  <div key={salesCardPeriod + salesCustomDate} className="card-fade">
-                    {salesDisplayData ? (
-                      <>
-                        <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(salesDisplayData.total_amount)}</span></div>
-                        <p className="msub">
-                          <strong>{salesDisplayData.invoice_count}</strong>{' '}
-                          {salesDisplayData.invoice_count === 1 ? 'invoice' : 'invoices'}
-                          {['today', 'yesterday', 'custom'].includes(salesCardPeriod) && salesDisplayData.synced_at && (
-                            <> · synced {new Date(salesDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</>
-                          )}
-                        </p>
-                        {salesHasDetail && (
-                          <div className="list plain" style={{ marginTop: 12 }}>
-                            {visibleSalesItems.map((item, idx) => {
-                              const cid      = item.customer_id
-                              const nameKey  = item.customer_name?.trim().toLowerCase()
-                              const staff    = (cid != null ? staffById[cid]  : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
-                              const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
-                              return (
-                                <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
-                                  <span className="body">
-                                    <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => openCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
-                                    <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
-                                  </span>
-                                  <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
-                                </div>
-                              )
-                            })}
-                            {sortedSalesItems.length > 10 && (
-                              <button className="sf link" style={{ padding: '10px 0 0' }} onClick={() => setShowAllSales(v => !v)}>
-                                {showAllSales ? 'Show top 10' : `Show all ${sortedSalesItems.length} invoices`}
-                              </button>
-                            )}
-                          </div>
-                        )}
-                        {!salesHasDetail && <p className="msub">Per-invoice breakdown not available from this Tally export</p>}
-                      </>
-                    ) : (
-                      <p className="msub">
-                        {salesCardPeriod === 'today' ? "No data yet — sync hasn't run today" : `No data for ${_periodLabel(salesCardPeriod, salesCustomDate)}`}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </section>
-
-              {/* Collections */}
-              <section className="card">
-                <div className="mhead">
-                  <span className="mlabel" style={{ color: 'var(--blue)' }}><Icon.received />Received</span>
-                </div>
-                <div className="seg-row">
-                  <div className="seg" role="group" aria-label="Collections period">
-                    {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Week'], ['this_month', 'Month']].map(([p, lbl]) => (
-                      <button key={p} aria-pressed={collCardPeriod === p} onClick={() => handleCollPeriod(p)}>{lbl}</button>
-                    ))}
-                  </div>
-                  <button className="seg-date" onClick={() => setCollPickerOpen(v => !v)}>
-                    {collCardPeriod === 'custom' && collCustomDate
-                      ? new Date(collCustomDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
-                      : '…'}
-                  </button>
-                </div>
-                {collPickerOpen && (
-                  <input type="date" className="seg-date" style={{ width: '100%', marginTop: 6 }} value={collCustomDate} max={TODAY} onChange={e => handleCollCustomDate(e.target.value)} />
-                )}
-
-                {collCardLoading ? (
-                  <div className="card-skeleton"><div className="skeleton skeleton--figure" /><div className="skeleton skeleton--line" /></div>
-                ) : (
-                  <div key={collCardPeriod + collCustomDate} className="card-fade">
-                    {collDisplayData ? (
-                      collDisplayData.invoice_count === 0 ? (
-                        <p className="msub" style={{ marginTop: 12 }}>
-                          {collCardPeriod === 'today'
-                            ? 'Not entered yet. Payments are usually entered a day or two later.'
-                            : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
-                        </p>
-                      ) : (
-                        <>
-                          <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(collDisplayData.total_amount)}</span></div>
-                          <p className="msub">
-                            <strong>{collDisplayData.invoice_count}</strong>{' '}
-                            {collDisplayData.invoice_count === 1 ? 'receipt' : 'receipts'}
-                            {['today', 'yesterday', 'custom'].includes(collCardPeriod) && collDisplayData.synced_at && (
-                              <> · synced {new Date(collDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</>
-                            )}
-                          </p>
-                          {collectionsHasDetail ? (
-                            <div className="list plain" style={{ marginTop: 12 }}>
-                              {sortedCollectionItems.map((item, idx) => {
-                                const cid     = item.customer_id
-                                const nameKey = item.customer_name?.trim().toLowerCase()
-                                const staff   = (cid != null ? staffById[cid] : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
-                                const cust    = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
-                                return (
-                                  <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
-                                    <span className="body">
-                                      <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => openCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
-                                      <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
-                                    </span>
-                                    <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
-                                  </div>
-                                )
-                              })}
-                            </div>
-                          ) : (
-                            <p className="msub">Per-receipt breakdown not available from this Tally export</p>
-                          )}
-                        </>
-                      )
-                    ) : (
-                      <p className="msub" style={{ marginTop: 12 }}>
-                        {collCardPeriod === 'today' ? "No collections yet today — sync hasn't run" : `No data for ${_periodLabel(collCardPeriod, collCustomDate)}`}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </section>
-
-              {/* Collections status — calm by default; the office normally batch-enters
-                  payments 1-3 days late, so this must not read as an alarm on an
-                  ordinary day. Only turns orange once it's genuinely unusual. */}
-              {lastCollectionDate && (
-                <p className="sf" style={{ padding: '0 2px', color: collectionsStale ? 'var(--orange)' : undefined }}>
-                  Payments entered in Tally up to{' '}
-                  {new Date(lastCollectionDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
-                  {collectionsStale && ' — nothing new in a while, worth checking'}
-                </p>
-              )}
-
-              {/* By staff */}
-              <div>
-                <div className="sh"><h2>By staff</h2></div>
-                <div className="list">
-                  {staffSummary.map(s => {
-                    const color  = STAFF_COLORS[s.staff_name] || NEUTRAL_COLOR
-                    const barPct = (s.total_pending / maxStaffPending) * 100
-                    return (
-                      <button className="item" key={s.staff_name} onClick={() => goToStaff(s.staff_name)}>
-                        <span className="av" style={{ background: color.bg, color: color.fg }}>{getInitials(s.staff_name)}</span>
-                        <span className="body">
-                          <div className="t1">{s.staff_name}</div>
-                          <div className="t2">{s.customer_count} active customers</div>
-                          <div className="staff-bar-track" style={{ height: 4, background: 'var(--fill)', borderRadius: 2, overflow: 'hidden', marginTop: 5 }}>
-                            <div style={{ width: `${barPct}%`, height: '100%', background: color.bg, borderRadius: 2 }} />
-                          </div>
-                        </span>
-                        <span className="val"><div className="v">{formatCompact(s.total_pending)}</div></span>
-                        <Icon.chev />
-                      </button>
-                    )
-                  })}
-                </div>
-                <p className="sf">Tap a name to see their customers.</p>
-              </div>
-
-              {/* Sales chart */}
-              <div>
-                <div className="sh"><h2>Sales</h2></div>
-                <section className="card">
-                  <div className="chead">
-                    <div>
-                      <div className="clabel">
-                        Total, {salesChartPeriod === 'fy' ? 'this FY' : salesChartPeriod === 'last_month' ? 'last month' : 'this month'}
-                      </div>
-                      <div className="mval" style={{ marginTop: 4 }}><span className="big">{formatINR(periodTotal)}</span></div>
-                      <div className="msub">{periodCount} {periodCount === 1 ? 'invoice' : 'invoices'}</div>
-                    </div>
-                    <div className="seg small" role="group" aria-label="Chart range">
-                      {[['this_month', 'Month'], ['last_month', 'Last'], ['fy', 'FY']].map(([p, lbl]) => (
-                        <button key={p} aria-pressed={salesChartPeriod === p} onClick={() => setSalesChartPeriod(p)}>{lbl}</button>
-                      ))}
-                    </div>
-                  </div>
-                  {salesHistory.length > 0 ? (
-                    <div className="chart-wrap">
-                      <ResponsiveContainer width="100%" height={140}>
-                        <BarChart data={chartData} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
-                          <CartesianGrid vertical={false} stroke={chartPalette.grid} />
-                          <XAxis dataKey="date" tick={{ fill: chartPalette.text, fontSize: 11 }} axisLine={{ stroke: chartPalette.grid }} tickLine={false} interval={salesChartPeriod === 'fy' ? 0 : 'preserveStartEnd'} />
-                          <YAxis hide />
-                          <Tooltip cursor={{ fill: 'rgba(48,176,199,0.08)' }} formatter={v => [formatINR(v), 'Sales']} contentStyle={{ background: chartPalette.tooltipBg, border: `1px solid ${chartPalette.tooltipBorder}`, borderRadius: 10, fontSize: 12 }} />
-                          <Bar dataKey="total" fill={chartPalette.bar} radius={[3, 3, 0, 0]} maxBarSize={salesChartPeriod === 'fy' ? 60 : 32} />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  ) : (
-                    <p className="msub">No data yet — sync hasn't run</p>
-                  )}
-                </section>
-              </div>
-
-              {/* Age of dues */}
-              <div>
-                <div className="sh"><h2>Age of dues</h2></div>
-                <section className="card">
-                  <div className="capsule" style={{ marginTop: 0, height: 12, borderRadius: 6 }}>
-                    {summary.bucketChartData.map((b, i) => (
-                      <i key={b.bucket} style={{ width: agingTotal > 0 ? `${(b.total / agingTotal) * 100}%` : 0, background: BUCKET_COLORS[i] || BUCKET_COLORS[0] }} />
-                    ))}
-                  </div>
-                  <div className="list plain" style={{ margin: '10px -16px -15px' }}>
-                    {summary.bucketChartData.map((b, i) => (
-                      <div className="item" key={b.bucket}>
-                        <span className="dot" style={{ background: BUCKET_COLORS[i] || BUCKET_COLORS[0] }}></span>
-                        <span className="body"><div className="t1">{BUCKET_LABELS[b.bucket] || b.bucket}</div></span>
-                        <span className="val">
-                          <div className="v">{formatCompact(b.total)}</div>
-                          <div className="s">{agingTotal > 0 ? Math.round(b.total / agingTotal * 100) : 0}%</div>
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-              </div>
-
-              {/* Top buyers */}
-              {topCustomers.length > 0 && (
-                <div>
-                  <div className="sh"><h2>Top buyers {salesChartPeriod === 'fy' ? 'this FY' : salesChartPeriod === 'last_month' ? 'last month' : 'this month'}</h2></div>
-                  <div className="list">
-                    {topCustomers.map((c, i) => {
-                      const cust = customerByName[c.name.trim().toLowerCase()]
-                      return (
-                        <div className={'item' + (cust ? ' link' : '')} key={i} onClick={cust ? () => openCustomer(cust) : undefined}>
-                          <span className="av" style={{ background: 'var(--teal)' }}>{i + 1}</span>
-                          <span className="body"><div className="t1">{c.name}</div></span>
-                          <span className="val"><div className="v">{formatCompact(c.total)}</div></span>
-                          {cust && <Icon.chev />}
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* Flagged */}
-              {flagged.length > 0 && (
-                <div>
-                  <div className="sh"><h2>Flagged</h2></div>
-                  <div className="list card--flagged">
-                    {flagged.map(c => {
-                      const cust = customersById[c.id]
-                      return (
-                        <div className={'item' + (cust ? ' link' : '')} key={c.id} onClick={cust ? () => openCustomer(cust) : undefined}>
-                          <span className="av" style={{ background: 'var(--red)' }}>!</span>
-                          <span className="body"><div className="t1">{c.customer_name}</div><div className="t2">{c.flagged_reason}</div></span>
-                          <span className="val"><div className="v" style={{ color: 'var(--red)' }}>{formatINR(c.total_pending)}</div></span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                  <p className="sf">Flagged accounts are not included in money owed.</p>
-                </div>
-              )}
-            </div>
-          </>
-        )}
+        <OverviewPage
+          summary={summary} presentRatio={presentRatio} agingTotal={agingTotal}
+          salesCardPeriod={salesCardPeriod} salesPickerOpen={salesPickerOpen} salesCustomDate={salesCustomDate}
+          salesCardLoading={salesCardLoading} salesDisplayData={salesDisplayData} salesHasDetail={salesHasDetail}
+          visibleSalesItems={visibleSalesItems} sortedSalesItems={sortedSalesItems} showAllSales={showAllSales}
+          collCardPeriod={collCardPeriod} collPickerOpen={collPickerOpen} collCustomDate={collCustomDate}
+          collCardLoading={collCardLoading} collDisplayData={collDisplayData} collectionsHasDetail={collectionsHasDetail}
+          sortedCollectionItems={sortedCollectionItems}
+          lastCollectionDate={lastCollectionDate} collectionsStale={collectionsStale}
+          staffSummary={staffSummary} maxStaffPending={maxStaffPending}
+          salesChartPeriod={salesChartPeriod} hasSalesHistory={salesHistory.length > 0} chartData={chartData}
+          periodTotal={periodTotal} periodCount={periodCount} chartPalette={chartPalette}
+          topCustomers={topCustomers} flagged={flagged}
+          staffById={staffById} staffByName={staffByName} customersById={customersById} customerByName={customerByName}
+          onSalesPeriod={handleSalesPeriod} onSalesCustomDate={handleSalesCustomDate}
+          onToggleSalesPicker={setSalesPickerOpen} onToggleShowAllSales={setShowAllSales}
+          onCollPeriod={handleCollPeriod} onCollCustomDate={handleCollCustomDate} onToggleCollPicker={setCollPickerOpen}
+          onGoToStaff={goToStaff} onSalesChartPeriod={setSalesChartPeriod} onOpenCustomer={openCustomer}
+        />
       </main>
 
       {/* ── Customers page ── */}
@@ -1239,31 +1379,7 @@ export default function App() {
           </p>
         )}
 
-        {filteredCustomers.length === 0 ? (
-          <div className="empty">No customers match your search.</div>
-        ) : (
-          <div className="list">
-            {filteredCustomers.map(c => (
-              <button
-                className={'item' + (c.id === highlightedId ? ' item--flash' : '')}
-                key={c.id}
-                onClick={() => openCustomer(c)}
-                ref={c.id === highlightedId ? el => el && el.scrollIntoView({ behavior: 'smooth', block: 'center' }) : null}
-              >
-                <span className="av" style={{ background: c.flagged ? 'var(--red)' : 'var(--indigo)' }}>{c.customer_name[0].toUpperCase()}</span>
-                <span className="body">
-                  <div className="t1">{c.customer_name}</div>
-                  <div className="t2">
-                    {c.assigned_to_name || 'Unassigned'}, {c.customer_type === 'cash' ? 'cash' : `${c.credit_days || '—'} day credit`}
-                    {c.flagged ? ` · ${c.flagged_reason}` : ''}
-                  </div>
-                </span>
-                <span className="val"><div className="v">{c.present_pending !== 0 ? formatINR(c.present_pending) : '—'}</div></span>
-                <Icon.chev />
-              </button>
-            ))}
-          </div>
-        )}
+        <CustomersList customers={filteredCustomers} highlightedId={highlightedId} onOpen={openCustomer} />
         <p className="sf">{filteredCustomers.length} of {staffFilteredCustomers.length} customers{staffFilter && ` · ${staffFilter}`}</p>
       </main>
 
