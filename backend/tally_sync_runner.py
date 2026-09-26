@@ -8,6 +8,8 @@ Modes:
   python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30   # backfill daily_sales + collections
   python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --force  # overwrite existing rows
   python tally_sync_runner.py --backfill --from 2026-04-01 --to 2026-04-30 --dry-run  # preview without writes
+  python tally_sync_runner.py --refresh-contacts --dry-run              # preview a full contact refresh (phone/mobile/address/gst) for every customer
+  python tally_sync_runner.py --refresh-contacts                        # one-time: apply it now, bypassing the daily ledger-master throttle
 
 Safety guarantees:
   - Old data is only deleted AFTER new data is fully inserted (insert-first pattern).
@@ -422,13 +424,36 @@ def _fy_start() -> date:
 
 
 def _extract_phone(text: str) -> str | None:
+    """
+    Returns the first plausible phone number (mobile or landline) found in
+    text. Splits on comma, semicolon, AND slash — the plain comma-only split
+    used to merge a multi-extension landline like "0427-2466651/55" into one
+    invalid 13-digit run (the "/55" alternate extension got swallowed into
+    the main number), silently returning None for a number that was right
+    there. Confirmed against real LEDGERPHONE data (see CLAUDE.md).
+    """
     if not text:
         return None
-    for segment in text.split(","):
+    for segment in re.split(r"[,;/]", text):
         digits = "".join(ch for ch in segment if ch.isdigit())
         if len(digits) == 10 and digits[0] in "6789":
             return digits
         if len(digits) in (10, 11) and digits[0] == "0":
+            return digits
+    return None
+
+
+def _extract_mobile(text: str) -> str | None:
+    """
+    Like _extract_phone but only ever returns a 10-digit mobile (never
+    matches the 0-prefixed landline branch) — used for Tally's LEDGERMOBILE
+    field specifically, which is expected to hold mobiles only.
+    """
+    if not text:
+        return None
+    for segment in re.split(r"[,;/]", text):
+        digits = "".join(ch for ch in segment if ch.isdigit())
+        if len(digits) == 10 and digits[0] in "6789":
             return digits
     return None
 
@@ -597,8 +622,14 @@ def _send_failure_email(error_summary: str):
 def _fetch_tally_ledger_master() -> dict:
     """
     Pull every ledger record from Tally and return
-    {name.lower(): {name, parent, phone, address, gstin}}.
+    {name.lower(): {name, parent, phone, mobile, address, gstin}}.
     Used to resolve new customer names found in Bills Receivable.
+
+    LEDGERMOBILE added 26-Sep-2026 — probe_ledger_phones.py found it
+    populated on 631 live ledgers vs only 208 for LEDGERPHONE, and covers
+    118 of the 122 customers previously missing a phone entirely. This was
+    the root cause of the 647-missing-phones gap: Step 4.6 only ever read
+    LEDGERPHONE + ADDRESS, never LEDGERMOBILE.
     """
     xml_body = (
         "<ENVELOPE>"
@@ -613,7 +644,7 @@ def _fetch_tally_ledger_master() -> dict:
         "<TDL><TDLMESSAGE>"
         '<COLLECTION NAME="AllLedgers" ISMODIFY="No">'
         "<TYPE>Ledger</TYPE>"
-        "<FETCH>NAME,PARENT,LEDGERPHONE,ADDRESS,PARTYGSTIN</FETCH>"
+        "<FETCH>NAME,PARENT,LEDGERPHONE,LEDGERMOBILE,ADDRESS,PARTYGSTIN</FETCH>"
         "</COLLECTION>"
         "</TDLMESSAGE></TDL>"
         "</DESC></BODY>"
@@ -635,6 +666,11 @@ def _fetch_tally_ledger_master() -> dict:
         if phone_m:
             phone = _extract_phone(html.unescape(phone_m.group(1)))
 
+        mobile   = None
+        mobile_m = re.search(r"<LEDGERMOBILE\b[^>]*>(.*?)</LEDGERMOBILE>", block)
+        if mobile_m:
+            mobile = _extract_mobile(html.unescape(mobile_m.group(1)))
+
         addr_lines = [
             html.unescape(a)
             for a in re.findall(r'<ADDRESS TYPE="String">(.*?)</ADDRESS>', block)
@@ -652,6 +688,7 @@ def _fetch_tally_ledger_master() -> dict:
             "name":    name,
             "parent":  parent,
             "phone":   phone,
+            "mobile":  mobile,
             "address": ", ".join(addr_lines) if addr_lines else None,
             "gstin":   gstin,
         }
@@ -766,6 +803,7 @@ def auto_insert_new_customers(bills: list, ledger_data: "dict | None" = None, dr
             "credit_days":    None if is_cash else 90,
             "assigned_to":    assigned_to,
             "phone":          ldata["phone"],
+            "mobile":         ldata["mobile"],
             "address":        ldata["address"],
             "gst_number":     ldata["gstin"],
             "flagged":        flagged,
@@ -807,12 +845,21 @@ def auto_insert_new_customers(bills: list, ledger_data: "dict | None" = None, dr
 
 # ── Step 4.6: Refresh contact/address fields from Tally ledger master ─────────
 
-def refresh_ledger_contacts(ledger_data: dict, dry_run: bool = False) -> int:
+def refresh_ledger_contacts(ledger_data: dict, dry_run: bool = False) -> dict:
     """
-    Step 4.6 — Compare phone, address, and gst_number for every existing customer
-    against the Tally ledger master and update any that have changed.
-    Never touches customer_name, assigned_to, flagged, or customer_type.
-    Returns number of customers updated.
+    Step 4.6 — Compare phone, mobile, address, and gst_number for every
+    existing customer against the Tally ledger master and update any that
+    have changed. Never touches customer_name, assigned_to, flagged, or
+    customer_type.
+
+    Returns a stats dict rather than a bare count — {"updated", "gained_mobile",
+    "gained_phone", "gained_any"} — so a one-time on-demand run (see
+    refresh_contacts_mode / --refresh-contacts) can report how many
+    customers actually gained a usable number, not just how many rows
+    changed (an address-only or GST-only change wouldn't move that needle).
+    "gained_any" specifically means a customer had neither phone nor mobile
+    before and has at least one now — the Call/WhatsApp buttons only appear
+    once that's true.
     """
     def _norm(v):
         return (v or "").strip() or None
@@ -824,7 +871,7 @@ def refresh_ledger_contacts(ledger_data: dict, dry_run: bool = False) -> int:
     while True:
         batch = (
             supa.table("customers")
-            .select("id, customer_name, phone, address, gst_number")
+            .select("id, customer_name, phone, mobile, address, gst_number")
             .range(offset, offset + 999)
             .execute().data
         )
@@ -833,31 +880,60 @@ def refresh_ledger_contacts(ledger_data: dict, dry_run: bool = False) -> int:
             break
         offset += 1000
 
-    updates = []
+    updates       = []
+    gained_mobile = 0
+    gained_phone  = 0
+    gained_any    = 0
     for cust in customers:
         ldata = ledger_data.get(cust["customer_name"].strip().lower())
         if not ldata:
             continue
+        old_phone  = _norm(cust["phone"])
+        old_mobile = _norm(cust.get("mobile"))
+        new_phone  = _norm(ldata["phone"])
+        new_mobile = _norm(ldata["mobile"])
+
         changed = {}
-        if _norm(cust["phone"])      != _norm(ldata["phone"]):   changed["phone"]      = _norm(ldata["phone"])
+        if old_phone  != new_phone:  changed["phone"]  = new_phone
+        if old_mobile != new_mobile: changed["mobile"] = new_mobile
         if _norm(cust["address"])    != _norm(ldata["address"]): changed["address"]    = _norm(ldata["address"])
         if _norm(cust["gst_number"]) != _norm(ldata["gstin"]):   changed["gst_number"] = _norm(ldata["gstin"])
+
         if changed:
             updates.append((cust["id"], changed))
+            if old_mobile is None and new_mobile is not None:
+                gained_mobile += 1
+            if old_phone is None and new_phone is not None:
+                gained_phone += 1
+            if old_phone is None and old_mobile is None and (new_phone is not None or new_mobile is not None):
+                gained_any += 1
+
+    stats = {
+        "updated":       len(updates),
+        "gained_mobile": gained_mobile,
+        "gained_phone":  gained_phone,
+        "gained_any":    gained_any,
+    }
 
     if not updates:
         log.info("  Ledger refresh: no changes")
-        return 0
+        return stats
 
     if dry_run:
-        log.info("  Ledger refresh: DRY RUN — would update %d customer(s)", len(updates))
-        return len(updates)
+        log.info(
+            "  Ledger refresh: DRY RUN — would update %d customer(s), %d gaining a usable number",
+            len(updates), gained_any,
+        )
+        return stats
 
     for cid, changed in updates:
         supa.table("customers").update(changed).eq("id", cid).execute()
 
-    log.info("  Ledger refresh: %d customer(s) updated", len(updates))
-    return len(updates)
+    log.info(
+        "  Ledger refresh: %d customer(s) updated, %d gained a usable phone/mobile number",
+        len(updates), gained_any,
+    )
+    return stats
 
 
 # ── Step 1: Tally connection check ─────────────────────────────────────────────
@@ -2765,6 +2841,35 @@ def backfill_collections_mode(dry_run: bool):
     )
 
 
+def refresh_contacts_mode(dry_run: bool) -> dict:
+    """
+    --refresh-contacts: one-time, on-demand contact refresh for every
+    existing customer, bypassing LEDGER_MASTER_THROTTLE_HOURS. Exists
+    because a fix to what fields Step 4.6 reads (adding LEDGERMOBILE — see
+    _fetch_tally_ledger_master) needs to reach every already-onboarded
+    customer immediately, not wait up to 24h for the next scheduled run.
+    """
+    refresh_start = time.monotonic()
+    log.info("[REFRESH-CONTACTS] Fetching Tally ledger master...")
+    ledger_data = _fetch_tally_ledger_master()
+    log.info("[REFRESH-CONTACTS] Ledger master: %d record(s) fetched", len(ledger_data))
+
+    stats = refresh_ledger_contacts(ledger_data, dry_run=dry_run)
+
+    if not dry_run:
+        state = _load_state()
+        state["last_ledger_master_run"] = datetime.now(UTC).isoformat()
+        _save_state(state)
+
+    log.info(
+        "[REFRESH-CONTACTS] Finished in %.1fs — %d customer(s) updated | "
+        "%d gained a mobile | %d gained a phone | %d gained a number where they had none before",
+        time.monotonic() - refresh_start,
+        stats["updated"], stats["gained_mobile"], stats["gained_phone"], stats["gained_any"],
+    )
+    return stats
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2777,6 +2882,7 @@ def main():
     parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
     parser.add_argument("--force",      action="store_true", help="Overwrite existing rows in --backfill mode")
     parser.add_argument("--backfill-collections", action="store_true", help="Rebuild daily_collections for the whole FY from Tally, month by month — one-time fix for late-entered receipts never being refetched")
+    parser.add_argument("--refresh-contacts", action="store_true", help="One-time: refresh phone/mobile/address/gst for every existing customer from live Tally right now, bypassing the daily ledger-master throttle")
     args = parser.parse_args()
 
     dry_run    = args.dry_run
@@ -2831,6 +2937,25 @@ def main():
                 backfill_collections_mode(dry_run=dry_run)
             except Exception as exc:
                 log.exception("BACKFILL-COLLECTIONS FAILED: %s", exc)
+                sys.exit(1)
+            return
+
+        # ── Refresh contacts mode ─────────────────────────────────────────────
+        if args.refresh_contacts:
+            log.info("=" * 60)
+            log.info("SUPREME BALAJI — REFRESH CONTACTS MODE")
+            if dry_run: log.info("  DRY RUN — no DB writes")
+            log.info("  Run   : %s", RUN_TS)
+            log.info("=" * 60)
+
+            if not check_tally():
+                log.error("Tally not reachable — cannot refresh contacts without live Tally.")
+                sys.exit(1)
+
+            try:
+                refresh_contacts_mode(dry_run=dry_run)
+            except Exception as exc:
+                log.exception("REFRESH-CONTACTS FAILED: %s", exc)
                 sys.exit(1)
             return
 

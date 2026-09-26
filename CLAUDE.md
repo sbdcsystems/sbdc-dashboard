@@ -218,7 +218,8 @@ Tally must be open and the correct company active before running a live sync.
 | customer_type | text | `credit` or `cash` |
 | credit_days | int | null for cash customers |
 | assigned_to | uuid FK→users.id | null = unassigned |
-| phone | text | |
+| phone | text | from Tally LEDGERPHONE — landline or mobile |
+| mobile | text | 10-digit mobile from Tally LEDGERMOBILE (added 26-Sep-2026 — root cause of 647 customers missing a phone: Step 4.6 never read this field before, only LEDGERPHONE/ADDRESS). Frontend Call uses mobile falling back to phone; WhatsApp uses mobile only. |
 | address | text | |
 | gst_number | text | |
 | flagged | bool | |

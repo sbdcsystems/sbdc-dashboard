@@ -1252,8 +1252,10 @@ export default function App() {
   const agingTotal = useMemo(() => summary ? summary.bucketChartData.reduce((s, b) => s + b.total, 0) : 0, [summary])
 
   const pageTitle = view === 'customers' ? 'Customers' : 'Summary'
-  const custCallHref = telHref(selectedCustomer?.phone)
-  const custWaHref   = waHref(selectedCustomer?.phone, cdTotalPending)
+  // Call prefers mobile (LEDGERMOBILE) and falls back to phone (LEDGERPHONE —
+  // landline or mobile); WhatsApp needs a real mobile, so mobile only.
+  const custCallHref = telHref(selectedCustomer?.mobile || selectedCustomer?.phone)
+  const custWaHref   = waHref(selectedCustomer?.mobile, cdTotalPending)
 
   const applyTheme = useCallback((t) => { setTheme(t); setMenuOpen(false) }, [])
 
