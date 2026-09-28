@@ -29,6 +29,8 @@ sbdc-system/
     add_customers.py          ← one-off customer insert script
     check_jsonb.py            ← diagnostic: inspect daily_sales JSONB
     probe_tally_reports.py    ← diagnostic: test Tally report types
+    audit.py                  ← standalone read-only daily Tally-vs-Supabase data-integrity check (see audit_results below)
+    run_audit.bat             ← Task Scheduler entry point for audit.py on the office PC (mirrors run_sync.bat)
     logs/                     ← sync logs (sync_YYYYMMDD_HHMMSS.log)
     last_sync_status.json     ← written after every sync run (overall + per-step status, see below)
     sync_state.json           ← rotation/throttle state incl. last_alterid, last_receipt_alterid, last_ledger_master_run, last_full_sales_history_sweep, last_full_collections_sweep (not committed — machine-local runtime state)
@@ -333,6 +335,14 @@ ALTER TABLE audit_results ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "anon_read" ON audit_results FOR SELECT TO anon USING (true);
 ```
 Written by `backend/audit.py` (read-only against both Tally and Supabase; the only thing it writes is this one row). The dashboard header shows a small red "Data check failed" badge when the latest row's `overall_pass` is false.
+
+**Outstanding check uses Bills Receivable, NOT ledger ClosingBalance — confirmed dead end.** ClosingBalance was tried first and rejected: it times out on this Tally install for a ledger with a large bill history, and — separately — nets on-account credits differently than Bills Receivable does. Confirmed case: **Sri Bhadri Narayana Textiles** shows Rs 14,00,846 across 147 bills in Bills Receivable, but its true ledger ClosingBalance is Rs 6,06,949 — a ~Rs 7.94L gap from a pre-FY opening-balance credit that predates any Payment/Receipt voucher Bills Receivable would show. `audit.py` fetches live Bills Receivable instead (same report, same `_CREDIT_VCH_TYPES` sign convention as Step 2/3 — see the "KNOWN LIMITATION" comment above `_CREDIT_VCH_TYPES` in `tally_sync_runner.py`), since that's the dashboard's own actual source. Both sides sum **signed** pending amounts (never `abs()`) — an on-account credit legitimately nets a total down, sometimes negative (e.g. an "Unassigned" staff bucket).
+
+**Scheduling**: `backend/run_audit.bat` (mirrors `run_sync.bat` — `git pull` first, non-fatal on failure, then the audit; output appended to `backend/logs/audit.log`). Register it as a daily SYSTEM task from an elevated PowerShell/Command Prompt on the office PC:
+```
+schtasks /create /tn "SBDC Data Audit" /tr "C:\sbdc-system\backend\run_audit.bat" /sc daily /st 12:30 /ru SYSTEM /rl HIGHEST /f
+```
+Runs as SYSTEM specifically so it's not tied to any interactive user's login session (and so it never shows a console window on anyone's desktop — SYSTEM tasks run in an isolated, non-interactive session). `git pull` still authenticates fine under SYSTEM because the PAT is embedded directly in the remote URL (`.git/config`), not stored in a per-user credential vault SYSTEM wouldn't have access to. `/f` makes the command safe to re-run if the task already exists.
 
 **Standing rule: after ANY change to sync logic (`tally_sync_runner.py`) or frontend data logic (`App.jsx`'s data-fetching/aggregation code), run `python audit.py` on the office PC and confirm it prints `OVERALL: PASS` before calling that work done.** This is the project's real safety net against the class of bug fixed on 28-Sep-2026 (Sold/Received cards silently disagreeing with each other and with Tally) — it would have caught that immediately instead of waiting for someone to notice the numbers looked wrong.
 

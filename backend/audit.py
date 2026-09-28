@@ -14,10 +14,18 @@ tally_sync_runner.py, see CLAUDE.md) against Supabase for:
     non-customer parties excluded (see the 26-Sep-2026 collections-exclusion
     fix), so this checks that daily_collections agrees with Tally, not just
     that Supabase agrees with itself.
-  - Outstanding: current total ledger balance (all ages — this does NOT
-    re-verify the recent/stale 12-month bucket split Step 3 computes, only
-    that the FULL current balance matches Tally right now) + per-staff,
-    using the same _STAFF_GROUPS mapping as auto_insert_new_customers().
+  - Outstanding: current total + per-staff, from Tally's Bills Receivable
+    report (the exact same report and sign convention tally_sync_runner.py's
+    Step 2/3 use) — deliberately NOT ledger ClosingBalance. ClosingBalance is
+    a known dead end on this Tally install: it times out for customers with
+    a large bill history, and nets on-account credits differently than Bills
+    Receivable does (confirmed: Sri Bhadri Narayana Textiles shows
+    Rs 14,00,846 in Bills Receivable vs a true ledger balance of
+    Rs 6,06,949 — see CLAUDE.md's "KNOWN LIMITATION" comment on
+    _CREDIT_VCH_TYPES in tally_sync_runner.py). Bills Receivable is what the
+    dashboard's own `outstanding` table is actually built from, so comparing
+    against it catches real staleness/drift without re-litigating that
+    known, accepted gap.
 
 Prints a PASS/FAIL table and writes one row to audit_results (best-effort —
 see CLAUDE.md for the table's GRANT/RLS setup; a missing table must not
@@ -25,23 +33,16 @@ crash this script, matching the sync_status convention).
 
 Standalone by design — does not import tally_sync_runner.py, so running
 this can't trigger that module's import-time side effects (log file
-creation, sync.lock handling, etc.). Rebuilds its own minimal TDL request
-builders instead, following the same pattern as probe_alterid.py and
-probe_ledger_phones.py.
+creation, sync.lock handling, etc.). Rebuilds its own minimal TDL/Bills
+Receivable request builders instead, following the same pattern as
+probe_alterid.py and probe_ledger_phones.py.
 
 Run manually:
     python audit.py
-Run automatically once a day after the 12:00 sync (see CLAUDE.md for the
-Windows Task Scheduler command) — and per CLAUDE.md's standing rule, run
-this manually and confirm PASS after any change to sync or frontend data
-logic, before calling that work done.
-
-NOT independently confirmed on this Tally install (flagging rather than
-guessing, per this codebase's convention): whether Ledger ClosingBalance's
-sign convention needs adjustment for Sundry Debtor-side ledgers. This script
-compares absolute values on both sides specifically to sidestep that
-uncertainty — eyeball the first real run's per-staff numbers against Tally's
-own Outstanding Statement before trusting this check long-term.
+Run automatically once a day after the 12:00 sync via run_audit.bat + a
+Windows Task Scheduler entry (see CLAUDE.md) — and per CLAUDE.md's standing
+rule, run this manually and confirm PASS after any change to sync or
+frontend data logic, before calling that work done.
 """
 
 import html
@@ -69,21 +70,25 @@ TALLY_COMPANY = os.environ.get("TALLY_COMPANY_NAME", "SUPREME BALAJI DYE CHEM - 
 SALES_VOUCHER_TYPES   = ("GST SALES", "CC SALES")
 RECEIPT_VOUCHER_TYPES = ("Receipt", "PoS Receipt", "Cash Receipt")
 TIMEOUT = 90
+BILLS_RECEIVABLE_TIMEOUT = 120  # full FY, EXPLODEFLAG — same report as Step 2 (TALLY_TIMEOUT=60 there; more headroom here since this runs once/day, not throttled)
 
-# Mirrors tally_sync_runner.py's _STAFF_GROUPS — kept as a literal copy here
-# (not imported) so this script has no dependency on that module at all.
-_STAFF_GROUPS = {
-    "1.Venkatesh - Parties":     "Venkatesh",
-    "Bill Wise - J.Venkatesh":   "Venkatesh",
-    "2.Thiagarajan - Parties":   "Thiagarajan",
-    "Bill Wise - G.Thiagarajan": "Thiagarajan",
-    "3.Gowtham - Parties":       "Gowtham",
-    "Bill Wise - S.Gowtham":     "Gowtham",
-    "7.Levaset - Parties":       "Vijaya Priya",
-    "8.Vetri-Parties":           "Vijaya Priya",
-    "9.Vijayapriya - Parties":   "Vijaya Priya",
-    "Kanagaraj - Parties":       "Vijaya Priya",
-}
+# Same regex + sign convention as tally_sync_runner.py's Step 3 (_BILL_RE /
+# _CREDIT_VCH_TYPES) — kept as a literal copy here (not imported) so this
+# script has no dependency on that module at all.
+_BILL_RE = re.compile(
+    r"<BILLFIXED>\s*"
+    r"<BILLDATE>(.*?)</BILLDATE>\s*"
+    r"<BILLREF>(.*?)</BILLREF>\s*"
+    r"<BILLPARTY>(.*?)</BILLPARTY>\s*"
+    r"</BILLFIXED>\s*"
+    r"<BILLCL>(.*?)</BILLCL>\s*"
+    r"<BILLDUE>(.*?)</BILLDUE>\s*"
+    r"<BILLOVERDUE>(.*?)</BILLOVERDUE>\s*"
+    r"<BILLVCHDATE>.*?</BILLVCHDATE>\s*"
+    r"<BILLVCHTYPE>(.*?)</BILLVCHTYPE>",
+    re.DOTALL,
+)
+_CREDIT_VCH_TYPES = {"Payment", "Receipt"}
 
 PASS_TOLERANCE_RUPEES = 1.0  # rounding noise only, not a real mismatch
 
@@ -129,24 +134,20 @@ def _build_voucher_request(collection_id: str, fetch_fields: str, filter_formula
     )
 
 
-def _build_ledger_request() -> str:
+def _build_bills_receivable_request(fy_start: date, today: date) -> str:
     return (
         "<ENVELOPE>"
-        "<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
-        "<TYPE>Collection</TYPE><ID>AuditLedgers</ID>"
-        "</HEADER>"
-        "<BODY><DESC>"
+        "<HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER>"
+        "<BODY><EXPORTDATA><REQUESTDESC>"
+        "<REPORTNAME>Bills Receivable</REPORTNAME>"
         "<STATICVARIABLES>"
         f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
         "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"<SVFROMDATE>{fy_start.strftime('%Y%m%d')}</SVFROMDATE>"
+        f"<SVTODATE>{today.strftime('%Y%m%d')}</SVTODATE>"
+        "<EXPLODEFLAG>Yes</EXPLODEFLAG>"
         "</STATICVARIABLES>"
-        "<TDL><TDLMESSAGE>"
-        '<COLLECTION NAME="AuditLedgers" ISMODIFY="No">'
-        "<TYPE>Ledger</TYPE>"
-        "<FETCH>NAME,PARENT,ClosingBalance</FETCH>"
-        "</COLLECTION>"
-        "</TDLMESSAGE></TDL>"
-        "</DESC></BODY>"
+        "</REQUESTDESC></EXPORTDATA></BODY>"
         "</ENVELOPE>"
     )
 
@@ -221,28 +222,40 @@ def fetch_tally_collections(from_date: date, to_date: date, customer_names: set)
     return {"total": total, "count": count}
 
 
-def fetch_tally_outstanding() -> dict:
-    xml = _post(_build_ledger_request())
-    _raise_on_tally_error(xml)
+def fetch_tally_bills_receivable(fy_start: date, today: date, staff_by_name: dict) -> dict:
+    """
+    Fetches the same report, and applies the same on-account-credit sign
+    convention (Payment/Receipt bill types negate the amount), as
+    tally_sync_runner.py's Step 2/3 — see the module docstring for why this
+    replaces the earlier ClosingBalance-based check. Sums are SIGNED (not
+    abs), matching how the `outstanding` table's own pending_amount is
+    stored and how outstanding_by_staff_summary sums it — an on-account
+    credit legitimately nets a customer's/staff's total down, sometimes
+    below zero (e.g. an "Unassigned" bucket can be negative).
+    """
+    r = requests.post(
+        TALLY_URL, data=_build_bills_receivable_request(fy_start, today).encode("utf-8"),
+        headers={"Content-Type": "text/xml"}, timeout=BILLS_RECEIVABLE_TIMEOUT,
+    )
+    if len(r.content) < 200:
+        raise RuntimeError(f"Tally returned only {len(r.content)} bytes for Bills Receivable — is the correct company open?")
+    xml = r.content.decode("utf-8", errors="replace")
+
+    matches = _BILL_RE.findall(xml)
+    if not matches:
+        raise RuntimeError("No bill entries found in Bills Receivable XML — structure may have changed.")
+
     total = 0.0
     by_staff = {}
-    for raw_name, block in re.findall(r'<LEDGER NAME="(.*?)"[^>]*>(.*?)</LEDGER>', xml, re.DOTALL):
-        parent_m = re.search(r"<PARENT\b[^>]*>(.*?)</PARENT>", block)
-        parent = html.unescape(parent_m.group(1)).strip() if parent_m else ""
-        staff = _STAFF_GROUPS.get(parent)
-        if staff is None and "(GT)" in parent:
-            staff = "Thiagarajan"
-        if staff is None:
-            continue
-        cb_m = re.search(r"<CLOSINGBALANCE\b[^>]*>(.*?)</CLOSINGBALANCE>", block)
-        if not cb_m:
-            continue
+    for _date_raw, _ref, party, cl_raw, _due_raw, _overdue_raw, vch_type in matches:
         try:
-            bal = abs(float(cb_m.group(1)))
+            raw_amt = abs(float(cl_raw.strip()))
         except ValueError:
             continue
-        total += bal
-        by_staff[staff] = by_staff.get(staff, 0.0) + bal
+        amount = -raw_amt if vch_type.strip() in _CREDIT_VCH_TYPES else raw_amt
+        staff = staff_by_name.get(html.unescape(party.strip()).lower(), "Unassigned")
+        total += amount
+        by_staff[staff] = by_staff.get(staff, 0.0) + amount
     return {"total": total, "by_staff": by_staff}
 
 
@@ -275,18 +288,35 @@ def fetch_supabase_collections(supa, from_date: date, to_date: date) -> dict:
     return {"total": total, "count": count}
 
 
-def fetch_supabase_outstanding(supa) -> dict:
+def build_staff_maps(supa) -> tuple:
+    """
+    One shared customers+users fetch, returning both a customer_id-keyed map
+    (for the Supabase-side outstanding sum, which has real UUIDs) and a
+    lowercase-name-keyed map (for the Tally-side Bills Receivable sum, which
+    only has BILLPARTY names — same fallback pattern as the frontend uses
+    when a UUID isn't available).
+    """
     customers = []
     offset = 0
     while True:
-        batch = supa.table("customers").select("id,assigned_to").range(offset, offset + 999).execute().data
+        batch = supa.table("customers").select("id,customer_name,assigned_to").range(offset, offset + 999).execute().data
         customers.extend(batch)
         if len(batch) < 1000: break
         offset += 1000
     users = supa.table("users").select("id,name").execute().data
     name_by_uid = {u["id"]: u["name"] for u in users}
-    staff_by_cust = {c["id"]: name_by_uid.get(c["assigned_to"], "Unassigned") for c in customers}
 
+    staff_by_id   = {c["id"]: name_by_uid.get(c["assigned_to"], "Unassigned") for c in customers}
+    staff_by_name = {c["customer_name"].strip().lower(): name_by_uid.get(c["assigned_to"], "Unassigned") for c in customers}
+    return staff_by_id, staff_by_name
+
+
+def fetch_supabase_outstanding(supa, staff_by_id: dict) -> dict:
+    """
+    Sums are SIGNED (not abs) — see fetch_tally_bills_receivable's docstring;
+    this must match that sign handling or every comparison would show a
+    spurious mismatch even when the underlying data agrees.
+    """
     rows = []
     offset = 0
     while True:
@@ -298,9 +328,9 @@ def fetch_supabase_outstanding(supa) -> dict:
     total = 0.0
     by_staff = {}
     for r in rows:
-        amt = abs(float(r["pending_amount"] or 0))
+        amt = float(r["pending_amount"] or 0)
         total += amt
-        staff = staff_by_cust.get(r["customer_id"], "Unassigned")
+        staff = staff_by_id.get(r["customer_id"], "Unassigned")
         by_staff[staff] = by_staff.get(staff, 0.0) + amt
     return {"total": total, "by_staff": by_staff}
 
@@ -365,8 +395,9 @@ def run_audit() -> dict:
         s_coll = fetch_supabase_collections(supa, from_d, to_d)
         checks.append(_cmp(f"collections_total[{period_key}]", t_coll["total"], s_coll["total"], t_coll["count"], s_coll["count"]))
 
-    t_out = fetch_tally_outstanding()
-    s_out = fetch_supabase_outstanding(supa)
+    staff_by_id, staff_by_name = build_staff_maps(supa)
+    t_out = fetch_tally_bills_receivable(fy_start, today, staff_by_name)
+    s_out = fetch_supabase_outstanding(supa, staff_by_id)
     checks.append(_cmp("outstanding_total", t_out["total"], s_out["total"]))
     all_staff = set(t_out["by_staff"]) | set(s_out["by_staff"])
     for staff in sorted(all_staff):
