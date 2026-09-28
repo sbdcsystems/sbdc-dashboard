@@ -695,6 +695,70 @@ def _fetch_tally_ledger_master() -> dict:
     return result
 
 
+def _classify_and_build_customer_record(name: str, ldata: dict, user_by_name: dict) -> "tuple[dict, str, str, bool]":
+    """
+    Given a customer name and its Tally ledger data, applies the same
+    group→staff/cash/flagged classification rules auto_insert_new_customers
+    has always used. Extracted 28-Sep-2026 so the same-run targeted
+    auto-insert trigger (_auto_insert_missing_customers) can reuse the
+    identical logic instead of risking a hand-copied, silently-diverging
+    version — a pure extract-method refactor, same fields/conditions/order
+    as before, no behavior change to Step 4.5 itself.
+
+    Returns (record, parent, staff_label, known_group).
+    """
+    parent = ldata["parent"] or ""
+
+    is_gt               = "(GT)" in parent
+    is_staff            = parent in _STAFF_GROUPS
+    is_cash             = parent == _CASH_GROUP
+    is_bad_debt_current = parent == _BAD_DEBT_CURRENT
+    is_case_filed       = parent == _CASE_FILED
+    is_bad_debt_hist    = parent == _BAD_DEBT_HISTORICAL
+    known_group = (
+        is_gt or is_staff or is_cash
+        or is_bad_debt_current or is_case_filed or is_bad_debt_hist
+        or parent == "Sundry Debtors"
+        or parent.endswith("Group")
+    )
+
+    assigned_to = None
+    if is_gt:
+        assigned_to = user_by_name.get("Thiagarajan")
+    elif is_staff:
+        assigned_to = user_by_name.get(_STAFF_GROUPS[parent])
+
+    flagged        = False
+    flagged_reason = None
+    if is_bad_debt_current:
+        flagged        = True
+        flagged_reason = f"Bad debtor (Tally group: {parent})"
+    elif is_case_filed:
+        flagged        = True
+        flagged_reason = "Case filed - legal recovery in progress"
+    elif is_bad_debt_hist:
+        flagged        = True
+        flagged_reason = "Historical bad debt - written off in Tally, not currently trading"
+
+    staff_label = (
+        "Thiagarajan" if is_gt
+        else _STAFF_GROUPS.get(parent, "NULL (unrecognised group)")
+    )
+    record = {
+        "customer_name":  name,
+        "customer_type":  "cash" if is_cash else "credit",
+        "credit_days":    None if is_cash else 90,
+        "assigned_to":    assigned_to,
+        "phone":          ldata["phone"],
+        "mobile":         ldata["mobile"],
+        "address":        ldata["address"],
+        "gst_number":     ldata["gstin"],
+        "flagged":        flagged,
+        "flagged_reason": flagged_reason,
+    }
+    return record, parent, staff_label, known_group
+
+
 def auto_insert_new_customers(bills: list, ledger_data: "dict | None" = None, dry_run: bool = False) -> list:
     """
     Step 4.5 — For each customer name in bills that is not yet in the customers
@@ -753,62 +817,13 @@ def auto_insert_new_customers(bills: list, ledger_data: "dict | None" = None, dr
             not_found.append(name)
             continue
 
-        parent = ldata["parent"] or ""
-
-        is_gt               = "(GT)" in parent
-        is_staff            = parent in _STAFF_GROUPS
-        is_cash             = parent == _CASH_GROUP
-        is_bad_debt_current = parent == _BAD_DEBT_CURRENT
-        is_case_filed       = parent == _CASE_FILED
-        is_bad_debt_hist    = parent == _BAD_DEBT_HISTORICAL
-        known_group = (
-            is_gt or is_staff or is_cash
-            or is_bad_debt_current or is_case_filed or is_bad_debt_hist
-            or parent == "Sundry Debtors"
-            or parent.endswith("Group")
-        )
-
+        record, parent, staff_label, known_group = _classify_and_build_customer_record(name, ldata, user_by_name)
         if not known_group:
             log.warning(
                 "  '%s' has unrecognised PARENT group '%s' — inserting with assigned_to=NULL",
                 name, parent,
             )
             unrecognised.append((name, parent))
-
-        assigned_to = None
-        if is_gt:
-            assigned_to = user_by_name.get("Thiagarajan")
-        elif is_staff:
-            assigned_to = user_by_name.get(_STAFF_GROUPS[parent])
-
-        flagged        = False
-        flagged_reason = None
-        if is_bad_debt_current:
-            flagged        = True
-            flagged_reason = f"Bad debtor (Tally group: {parent})"
-        elif is_case_filed:
-            flagged        = True
-            flagged_reason = "Case filed - legal recovery in progress"
-        elif is_bad_debt_hist:
-            flagged        = True
-            flagged_reason = "Historical bad debt - written off in Tally, not currently trading"
-
-        staff_label = (
-            "Thiagarajan" if is_gt
-            else _STAFF_GROUPS.get(parent, "NULL (unrecognised group)")
-        )
-        record = {
-            "customer_name":  name,
-            "customer_type":  "cash" if is_cash else "credit",
-            "credit_days":    None if is_cash else 90,
-            "assigned_to":    assigned_to,
-            "phone":          ldata["phone"],
-            "mobile":         ldata["mobile"],
-            "address":        ldata["address"],
-            "gst_number":     ldata["gstin"],
-            "flagged":        flagged,
-            "flagged_reason": flagged_reason,
-        }
 
         if dry_run:
             log.info(
@@ -840,6 +855,203 @@ def auto_insert_new_customers(bills: list, ledger_data: "dict | None" = None, dr
     if not_found:
         for n in not_found:
             log.warning("    Not in Tally ledger master: '%s'", n)
+    return inserted_names
+
+
+# ── Same-run targeted auto-insert (28-Sep-2026) ─────────────────────────────
+#
+# Bug: a brand-new customer's first bill was silently dropped ("N bills
+# skipped — name not in customer table"), and their sales/sales_history rows
+# stayed permanently unmatched (customer_id NULL), until the next
+# 24h-throttled ledger master run (Step 4.5, above) happened to pick them
+# up — because Step 4.5 previously only ever ran inside that throttled
+# block. Confirmed live: "Shree Surya Yarn" (Rs 1,30,272) skipped in Step 3,
+# and showing up as an "Unassigned" diff in audit.py's per-staff outstanding
+# check, purely because the ledger master hadn't refreshed that run.
+#
+# Fix: whenever Step 3 (bills) or Step 9/10 (sales) finds a name that isn't
+# in the customers table, do a SMALL, TARGETED Tally ledger lookup for just
+# that name (_fetch_tally_ledgers_by_name — not a full ledger master
+# refresh) and auto-insert it right away, using the exact same
+# classification logic as Step 4.5 (_classify_and_build_customer_record),
+# then re-match before finally giving up on it.
+#
+# Deliberately NOT applied to Step 9b (collections/receipts): a receipt
+# voucher's party can legitimately be a non-customer ledger (a bank
+# settlement account, a related-party loan account — see the
+# "Non-customer parties excluded from collections totals" section above,
+# and the explicit, already-decided exclusions for Axis Bank ledgers,
+# B.Nagappa Dye Chem, Lock & Key, etc.). Bills and sales vouchers don't have
+# that ambiguity — a bill or a sales invoice is always FOR a real customer —
+# but blindly auto-inserting every unresolved receipt party would silently
+# create spurious "customer" rows for bank/loan ledgers and undo those
+# already-reviewed decisions. If collections ever need this too, it must
+# first cross-check against the same exclusion criteria, not reuse this
+# function directly.
+
+def _fetch_tally_ledgers_by_name(names: list) -> dict:
+    """
+    Targeted ledger lookup for a small, specific list of names — NOT a full
+    ledger master refresh. Same FETCH fields and parsing shape as
+    _fetch_tally_ledger_master (kept as an independent copy rather than a
+    shared helper, so that function is never at risk of being affected by
+    this one), just filtered server-side to these names via the same
+    <FILTER>/<SYSTEM TYPE="Formulae"> mechanism already used elsewhere in
+    this file.
+    """
+    if not names:
+        return {}
+    name_formula = " OR ".join(f'$Name = "{n}"' for n in names)
+    xml_body = (
+        "<ENVELOPE>"
+        "<HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE><ID>TargetedLedgers</ID>"
+        "</HEADER>"
+        "<BODY><DESC>"
+        "<STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{TALLY_COMPANY}</SVCURRENTCOMPANY>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        "</STATICVARIABLES>"
+        "<TDL><TDLMESSAGE>"
+        '<COLLECTION NAME="TargetedLedgers" ISMODIFY="No">'
+        "<TYPE>Ledger</TYPE>"
+        "<FETCH>NAME,PARENT,LEDGERPHONE,LEDGERMOBILE,ADDRESS,PARTYGSTIN</FETCH>"
+        "<FILTER>TargetedLedgersFilter</FILTER>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="TargetedLedgersFilter">{_xml_escape_formula(name_formula)}</SYSTEM>'
+        "</TDLMESSAGE></TDL>"
+        "</DESC></BODY>"
+        "</ENVELOPE>"
+    )
+    raw = _tally_post(xml_body, timeout=TALLY_LEDGER_TIMEOUT)
+    xml = raw.decode("utf-8", errors="replace")
+
+    result = {}
+    for raw_name, block in re.findall(
+        r'<LEDGER NAME="(.*?)"[^>]*>(.*?)</LEDGER>', xml, re.DOTALL
+    ):
+        name     = html.unescape(raw_name.strip())
+        parent_m = re.search(r"<PARENT\b[^>]*>(.*?)</PARENT>", block)
+        parent   = html.unescape(parent_m.group(1).strip()) if parent_m else None
+
+        phone    = None
+        phone_m  = re.search(r"<LEDGERPHONE\b[^>]*>(.*?)</LEDGERPHONE>", block)
+        if phone_m:
+            phone = _extract_phone(html.unescape(phone_m.group(1)))
+
+        mobile   = None
+        mobile_m = re.search(r"<LEDGERMOBILE\b[^>]*>(.*?)</LEDGERMOBILE>", block)
+        if mobile_m:
+            mobile = _extract_mobile(html.unescape(mobile_m.group(1)))
+
+        addr_lines = [
+            html.unescape(a)
+            for a in re.findall(r'<ADDRESS TYPE="String">(.*?)</ADDRESS>', block)
+        ]
+        if not phone:
+            for line in addr_lines:
+                phone = _extract_phone(line)
+                if phone:
+                    break
+
+        gstin_m = re.search(r"<PARTYGSTIN\b[^>]*>(.*?)</PARTYGSTIN>", block)
+        gstin   = html.unescape(gstin_m.group(1).strip()) if gstin_m else None
+
+        result[name.lower()] = {
+            "name":    name,
+            "parent":  parent,
+            "phone":   phone,
+            "mobile":  mobile,
+            "address": ", ".join(addr_lines) if addr_lines else None,
+            "gstin":   gstin,
+        }
+    return result
+
+
+def _auto_insert_missing_customers(missing_names: "set[str]", dry_run: bool = False) -> "tuple[list[str], set[str]]":
+    """
+    Same-run auto-insert for a small, specific set of customer names not yet
+    in the customers table. Does a targeted Tally ledger lookup for just
+    these names (_fetch_tally_ledgers_by_name), then applies the exact same
+    classification/insert logic as Step 4.5
+    (_classify_and_build_customer_record) so the two paths can never
+    silently diverge.
+
+    Returns (inserted_names, still_missing) — still_missing covers names not
+    found in Tally's ledger at all (a real data problem, not a timing one)
+    or whose insert failed, so callers know not to keep retrying them.
+    """
+    if not missing_names:
+        return [], set()
+
+    log.info("  Targeted auto-insert — %d name(s) not in customers table: %s", len(missing_names), sorted(missing_names))
+    try:
+        ledger_data = _fetch_tally_ledgers_by_name(sorted(missing_names))
+    except Exception as exc:
+        log.warning("  Targeted auto-insert — ledger lookup failed (non-fatal): %s", exc)
+        return [], set(missing_names)
+
+    supa         = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+    users        = supa.table("users").select("id, name").execute().data
+    user_by_name = {u["name"]: u["id"] for u in users}
+
+    inserted_names = []
+    still_missing  = set()
+    for name in sorted(missing_names):
+        ldata = ledger_data.get(name.lower())
+        if not ldata:
+            log.warning("  Targeted auto-insert — '%s' not found in Tally ledger — skipping", name)
+            still_missing.add(name)
+            continue
+
+        record, parent, staff_label, known_group = _classify_and_build_customer_record(name, ldata, user_by_name)
+        if not known_group:
+            log.warning(
+                "  Targeted auto-insert — '%s' has unrecognised PARENT group '%s' — inserting with assigned_to=NULL",
+                name, parent,
+            )
+
+        if dry_run:
+            log.info("  DRY RUN — targeted auto-insert would insert '%s' (group: %s → %s)", name, parent, staff_label)
+            inserted_names.append(name)
+            continue
+
+        try:
+            supa.table("customers").insert(record).execute()
+            log.info("  Targeted auto-insert — AUTO-INSERTED '%s' (group: %s → %s)", name, parent, staff_label)
+            inserted_names.append(name)
+        except Exception as exc:
+            log.warning("  Targeted auto-insert — failed to insert '%s': %s", name, exc)
+            still_missing.add(name)
+
+    return inserted_names, still_missing
+
+
+def _resolve_with_targeted_insert(cust_id_map: dict, missing_names: set, dry_run: bool) -> list:
+    """
+    Given a customer_id map already built from the customers table, and a
+    set of (original-case) names that failed to resolve against it, runs
+    _auto_insert_missing_customers for just those names and — for any that
+    were genuinely new and got inserted — updates cust_id_map in place with
+    the new id, keyed the same way (lower-cased, stripped) as the caller's
+    own map. Returns the list of names that were inserted (original case),
+    so the caller can re-run its own per-item matching for just those.
+
+    In dry_run, the insert doesn't actually happen (see
+    _auto_insert_missing_customers), so there's no real id to look up —
+    returns [] in that case, same as if nothing were missing at all. This
+    is a deliberate, minor gap in dry-run's preview accuracy for this one
+    rare case (a brand-new customer's very first bill/sale), not a write.
+    """
+    if not missing_names:
+        return []
+    inserted_names, _still_missing = _auto_insert_missing_customers(missing_names, dry_run=dry_run)
+    if not inserted_names or dry_run:
+        return []
+    supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+    rows = supa.table("customers").select("id, customer_name").in_("customer_name", inserted_names).execute().data
+    for row in rows:
+        cust_id_map[row["customer_name"].strip().lower()] = row["id"]
     return inserted_names
 
 
@@ -1183,15 +1395,9 @@ def reload_supabase(bills: list, dry_run: bool = False):
         offset += 1000
     log.info("  %d customers in database", len(cust_map))
 
-    records   = []
-    unmatched = {}
-    for b in bills:
-        cid = cust_map.get(b["customer_name"].strip().lower())
-        if not cid:
-            unmatched[b["customer_name"]] = unmatched.get(b["customer_name"], 0) + 1
-            continue
-        records.append({
-            "customer_id":          cid,
+    def _bill_record(b):
+        return {
+            "customer_id":          cust_map[b["customer_name"].strip().lower()],
             "invoice_ref":          b["invoice_ref"],
             "invoice_date":         b["invoice_date"],
             "due_date":             b["due_date"],
@@ -1200,7 +1406,39 @@ def reload_supabase(bills: list, dry_run: bool = False):
             "days_overdue":         b["days_overdue"],
             "age_status":           b["age_status"],
             "synced_from_tally_at": SYNC_TIMESTAMP,
-        })
+        }
+
+    records   = []
+    unmatched = {}
+    for b in bills:
+        cid = cust_map.get(b["customer_name"].strip().lower())
+        if not cid:
+            unmatched[b["customer_name"]] = unmatched.get(b["customer_name"], 0) + 1
+            continue
+        records.append(_bill_record(b))
+
+    # Same-run targeted auto-insert (28-Sep-2026) — see the comment above
+    # _fetch_tally_ledgers_by_name for why. A brand-new customer's bill used
+    # to be skipped here and stay skipped until the next 24h-throttled
+    # ledger master run; now it's looked up and inserted immediately, and
+    # its bill(s) recovered into `records` before anything is finally
+    # given up on.
+    targeted_inserted = []
+    if unmatched:
+        targeted_inserted = _resolve_with_targeted_insert(cust_map, set(unmatched.keys()), dry_run)
+        if targeted_inserted:
+            recovered_names = set()
+            for b in bills:
+                if b["customer_name"] in targeted_inserted and cust_map.get(b["customer_name"].strip().lower()):
+                    records.append(_bill_record(b))
+                    recovered_names.add(b["customer_name"])
+            for name in recovered_names:
+                del unmatched[name]
+            if recovered_names:
+                log.info(
+                    "  Recovered bill(s) for newly auto-inserted customer(s): %s",
+                    sorted(recovered_names),
+                )
 
     n_skipped = len(bills) - len(records)
     if unmatched:
@@ -1235,7 +1473,7 @@ def reload_supabase(bills: list, dry_run: bool = False):
 
     if dry_run:
         log.info("  DRY RUN — all Supabase writes skipped.")
-        return len(records), n_skipped, unmatched
+        return len(records), n_skipped, unmatched, targeted_inserted
 
     # ── Step 6: Clean up any partial records from a previous failed attempt ───
     # (Deletes rows tagged with THIS run's SYNC_TIMESTAMP, which on a fresh run
@@ -1295,7 +1533,7 @@ def reload_supabase(bills: list, dry_run: bool = False):
             break
     log.info("  Deleted %d old records", deleted)
 
-    return inserted, n_skipped, unmatched
+    return inserted, n_skipped, unmatched, targeted_inserted
 
 
 # ── Shared: one day of vouchers via TDL Collection ────────────────────────────
@@ -1405,8 +1643,21 @@ def _fetch_vouchers_for_day(target_date: date, kind: str, collection_id: str) ->
     return items
 
 
-def _resolve_customer_ids(supa, items: list) -> int:
-    """Stamp each item's customer_id UUID by name lookup. Returns matched count."""
+def _resolve_customer_ids(supa, items: list, attempt_auto_insert: bool = False, dry_run: bool = False) -> int:
+    """
+    Stamp each item's customer_id UUID by name lookup. Returns matched count.
+
+    attempt_auto_insert (28-Sep-2026, default False — opt-in): if True, any
+    item still unresolved after the first pass gets a same-run targeted
+    auto-insert attempt (see _fetch_tally_ledgers_by_name), then a second
+    pass. Only sync_today_sales (Step 9) opts in — sync_today_collections
+    (Step 9b) deliberately does NOT, since a receipt's party can legitimately
+    be a non-customer ledger (bank/loan account); auto-inserting every
+    unresolved receipt party would silently create spurious customer rows
+    and undo the already-decided exclusions in "Non-customer parties
+    excluded from collections totals" above. A sales voucher doesn't have
+    that ambiguity — it's always billed to a real customer.
+    """
     cust_id_map = {}
     offset = 0
     while True:
@@ -1423,11 +1674,25 @@ def _resolve_customer_ids(supa, items: list) -> int:
         offset += 1000
 
     matched = 0
+    unresolved_names = set()
     for item in items:
         cid = cust_id_map.get(item["customer_name"].strip().lower())
         item["customer_id"] = cid
         if cid:
             matched += 1
+        elif attempt_auto_insert and item["customer_name"].strip():
+            unresolved_names.add(item["customer_name"].strip())
+
+    if unresolved_names:
+        targeted_inserted = _resolve_with_targeted_insert(cust_id_map, unresolved_names, dry_run)
+        if targeted_inserted:
+            for item in items:
+                if item["customer_name"].strip() in targeted_inserted and not item["customer_id"]:
+                    cid = cust_id_map.get(item["customer_name"].strip().lower())
+                    if cid:
+                        item["customer_id"] = cid
+                        matched += 1
+
     return matched
 
 
@@ -1463,7 +1728,9 @@ def sync_today_sales(dry_run: bool = False, target_date: "date | None" = None):
 
     supa = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
 
-    matched = _resolve_customer_ids(supa, items)
+    # attempt_auto_insert=True here (Step 9, sales) but NOT at Step 9b's
+    # equivalent call below — see _resolve_customer_ids' docstring for why.
+    matched = _resolve_customer_ids(supa, items, attempt_auto_insert=True, dry_run=dry_run)
     log.info(
         "  UUID resolved: %d / %d items (%d unmatched — name variation or new customer)",
         matched, len(items), len(items) - matched,
@@ -2230,16 +2497,37 @@ def _upsert_sales_records(all_records: list, dry_run: bool) -> float:
         offset += 1000
 
     matched_uuid = 0
+    unresolved_names = set()
     for rec in all_records:
         cname = (rec.get("customer_name") or "").strip().lower()
         cid   = cust_id_map.get(cname)
         rec["customer_id"] = cid
         if cid:
             matched_uuid += 1
+        elif rec.get("customer_name", "").strip():
+            unresolved_names.add(rec["customer_name"].strip())
     log.info(
         "  UUID resolved: %d / %d records (%d unmatched — name variation or new customer)",
         matched_uuid, len(all_records), len(all_records) - matched_uuid,
     )
+
+    # Same-run targeted auto-insert (28-Sep-2026) — see the comment above
+    # _fetch_tally_ledgers_by_name. Safe here (unlike Step 9b) because a
+    # sales_history row is always for a real customer, never a non-customer
+    # ledger.
+    if unresolved_names:
+        targeted_inserted = _resolve_with_targeted_insert(cust_id_map, unresolved_names, dry_run)
+        if targeted_inserted:
+            recovered = 0
+            for rec in all_records:
+                if rec.get("customer_name", "").strip() in targeted_inserted and not rec["customer_id"]:
+                    cid = cust_id_map.get(rec["customer_name"].strip().lower())
+                    if cid:
+                        rec["customer_id"] = cid
+                        matched_uuid += 1
+                        recovered += 1
+            if recovered:
+                log.info("  UUID resolved (after targeted auto-insert): +%d record(s)", recovered)
 
     upserted = 0
     for i in range(0, len(all_records), SUPABASE_BATCH):
@@ -2638,8 +2926,14 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
     Post-sync safety check (non-fatal — caller must catch exceptions):
     1. Voucher count: re-fetches count from Tally independently and compares
        against fetched_count. Retries once on mismatch.
-    2. Step 9 vs Step 10 cross-check: if totals differ by more than ₹1,
-       logs a per-voucher mismatch report pulling from daily_sales + sales_history.
+    2. Step 9 vs actual sales_history cross-check: if totals differ by more
+       than ₹1, logs a per-voucher mismatch report pulling from
+       daily_sales + sales_history. Compares against sales_history's real
+       cumulative total for the date (queried fresh here), NOT the
+       step10_total argument directly — see the inline comment above that
+       query for why (fixed 28-Sep-2026: step10_total in AlterID-incremental
+       mode is only this run's own fetch delta, which can be legitimately 0
+       on a day already fully captured by an earlier run).
 
     Status has four values, not just OK/MISMATCH — if Tally can't be reached
     for the independent count check, that is reported as UNKNOWN rather than
@@ -2687,8 +2981,34 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
         log.warning("[RECONCILE] Could not fetch Tally count — STATUS will be UNKNOWN, not OK: %s", exc)
         count_status = "unknown"
 
-    # ── 2. Step 9 vs Step 10 total cross-check ───────────────────────────────
-    diff     = abs(step9_total - step10_total)
+    # ── 2. Step 9 vs Supabase sales_history cross-check ──────────────────────
+    # Compares Step 9's total against the ACTUAL sales_history rows for this
+    # date in Supabase, NOT the step10_total argument directly. Bug fixed
+    # 28-Sep-2026: in AlterID-incremental mode, step10_total is only the
+    # total among vouchers fetched in THIS run's incremental delta — which
+    # is legitimately 0 (or partial) on a run where nothing new happened
+    # today, since everything was already captured by an earlier run the
+    # same day. Comparing Step 9's always-full daily total against that
+    # incremental-delta figure directly reported a MISMATCH (downgrading an
+    # entirely healthy run to "partial") purely because Step 10 had nothing
+    # new to fetch — confirmed live: "Step10: Rs 0.00" while sales_history
+    # already held the correct, complete total. Falls back to the old
+    # step10_total-based comparison only if this query itself fails
+    # (non-fatal, degraded — matches this function's existing philosophy).
+    s10_by_ref       = None
+    s10_actual_total = step10_total
+    try:
+        supa       = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+        s10_resp   = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
+        s10_by_ref = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
+        s10_actual_total = round(sum(s10_by_ref.values()), 2)
+    except Exception as exc:
+        log.warning(
+            "[RECONCILE] Could not fetch sales_history total for %s — falling back to this run's own Step10 figure: %s",
+            sync_date.isoformat(), exc,
+        )
+
+    diff     = abs(step9_total - s10_actual_total)
     total_ok = diff <= 1.0
 
     # A voucher entered in the gap between Step 9 (runs first) and Step 10
@@ -2699,19 +3019,15 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
     # present in Step 10's data (sales_history) but not Step 9's
     # (daily_sales.items) for the same date. If those Step10-only vouchers'
     # total fully accounts for the diff, this is late-arriving data, not a
-    # real problem — added 28-Sep-2026 after this was confirmed live to
-    # otherwise mark an entirely healthy run "partial" during busy billing.
+    # real problem.
     pending_explained = False
     step10_only_total = 0.0
     step10_only_refs  = []
-    if not total_ok:
+    if not total_ok and s10_by_ref is not None:
         try:
             supa      = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
             s9_resp   = supa.table("daily_sales").select("items").eq("sale_date", sync_date.isoformat()).execute()
             s9_items  = (s9_resp.data[0] if s9_resp.data else {}).get("items") or []
-
-            s10_resp     = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
-            s10_by_ref   = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
 
             s9_refs = {item.get("invoice_ref") or "" for item in s9_items}
             for ref, s10_amt in s10_by_ref.items():
@@ -2719,7 +3035,7 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
                     step10_only_total += s10_amt
                     step10_only_refs.append(ref)
 
-            if step10_total > step9_total and abs(step10_only_total - diff) <= 1.0:
+            if s10_actual_total > step9_total and abs(step10_only_total - diff) <= 1.0:
                 pending_explained = True
         except Exception as exc:
             log.warning("[RECONCILE] Could not check for a pending-voucher explanation (non-fatal): %s", exc)
@@ -2736,24 +3052,25 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
         status = "OK"
 
     log.info(
-        "[RECONCILE] Date: %s | Vouchers: %d/%s | Step9: ₹%s | Step10: ₹%s | STATUS: %s",
+        "[RECONCILE] Date: %s | Vouchers: %d/%s | Step9: ₹%s | Step10 (this run's fetch): ₹%s | Step10 (sales_history total): ₹%s | STATUS: %s",
         sync_date.isoformat(),
         fetched_count,
         str(tally_count) if tally_count is not None else "?",
         f"{step9_total:,.2f}",
         f"{step10_total:,.2f}",
+        f"{s10_actual_total:,.2f}",
         status,
     )
 
     if not total_ok:
         if pending_explained:
             log.info(
-                "[RECONCILE] PENDING — Step9/Step10 diff of ₹%s for %s fully explained by voucher(s) entered between the two steps (%s) — not a mismatch",
+                "[RECONCILE] PENDING — Step9/sales_history diff of ₹%s for %s fully explained by voucher(s) entered between the two steps (%s) — not a mismatch",
                 f"{diff:,.2f}", sync_date.isoformat(), ", ".join(step10_only_refs),
             )
         else:
             log.warning(
-                "[RECONCILE] DIFF DETAIL — Step9 vs Step10 differ by ₹%s for %s",
+                "[RECONCILE] DIFF DETAIL — Step9 vs sales_history differ by ₹%s for %s",
                 f"{diff:,.2f}", sync_date.isoformat(),
             )
             try:
@@ -2761,15 +3078,17 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
                 s9_resp   = supa.table("daily_sales").select("items").eq("sale_date", sync_date.isoformat()).execute()
                 s9_items  = (s9_resp.data[0] if s9_resp.data else {}).get("items") or []
 
-                s10_resp     = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
-                s10_by_ref   = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
+                s10_by_ref_detail = s10_by_ref
+                if s10_by_ref_detail is None:
+                    s10_resp = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
+                    s10_by_ref_detail = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
 
                 s9_refs = set()
                 for item in s9_items:
                     ref    = item.get("invoice_ref") or ""
                     s9_amt = float(item.get("amount") or 0)
                     s9_refs.add(ref)
-                    s10_amt = s10_by_ref.get(ref)
+                    s10_amt = s10_by_ref_detail.get(ref)
                     if s10_amt is None:
                         log.warning("[RECONCILE]   %s — Step9: ₹%s | Step10: NOT FOUND", ref, f"{s9_amt:,.2f}")
                     elif abs(s9_amt - s10_amt) > 1:
@@ -2777,7 +3096,7 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
                             "[RECONCILE]   %s — Step9: ₹%s | Step10: ₹%s | Diff: ₹%s",
                             ref, f"{s9_amt:,.2f}", f"{s10_amt:,.2f}", f"{abs(s9_amt - s10_amt):,.2f}",
                         )
-                for ref, s10_amt in s10_by_ref.items():
+                for ref, s10_amt in s10_by_ref_detail.items():
                     if ref not in s9_refs:
                         log.warning("[RECONCILE]   %s — Step9: NOT FOUND | Step10: ₹%s", ref, f"{s10_amt:,.2f}")
             except Exception as exc:
@@ -3050,7 +3369,8 @@ def main():
                 log.info("  Reading: %s", local_xml)
                 xml_text = local_xml.read_text(encoding="utf-8", errors="replace")
                 bills = parse_xml(xml_text)
-                inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
+                inserted, skipped, unmatched, targeted_new = reload_supabase(bills, dry_run=dry_run)
+                auto_inserted = auto_inserted + targeted_new
                 step_status["outstanding"] = "success"
                 outstanding_ran = True
             else:
@@ -3077,7 +3397,8 @@ def main():
                         log.info("Step 2/3 — forced (%s), ignoring the %dh throttle", "--full" if args.full else "--force-outstanding", OUTSTANDING_THROTTLE_HOURS)
                     xml_text = fetch_tally_xml()
                     bills = parse_xml(xml_text)
-                    inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
+                    inserted, skipped, unmatched, targeted_new = reload_supabase(bills, dry_run=dry_run)
+                    auto_inserted = auto_inserted + targeted_new
                     step_status["outstanding"] = "success"
                     outstanding_ran = True
                 else:
@@ -3105,7 +3426,15 @@ def main():
                         ledger_data = _fetch_tally_ledger_master()
                         log.info("  Ledger master: %d records fetched", len(ledger_data))
                         if outstanding_ran:
-                            auto_inserted = auto_insert_new_customers(bills, ledger_data=ledger_data, dry_run=dry_run)
+                            # + (append), not = (overwrite) — the targeted
+                            # auto-insert above (reload_supabase, Step 3) may
+                            # already have inserted some of this run's new
+                            # customers; auto_insert_new_customers()'s own
+                            # missing-customer query re-checks Supabase fresh,
+                            # so it naturally won't try to re-insert those,
+                            # but its return value must be ADDED to, not
+                            # replace, what's already in auto_inserted.
+                            auto_inserted = auto_inserted + auto_insert_new_customers(bills, ledger_data=ledger_data, dry_run=dry_run)
                         else:
                             log.info("  Step 4.5 (auto-insert) skipped — no fresh bills this run (Step 2/3 was throttled)")
                         refresh_ledger_contacts(ledger_data, dry_run=dry_run)
