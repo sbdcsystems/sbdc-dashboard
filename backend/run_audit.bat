@@ -19,10 +19,12 @@ REM  audit, without the cost of a full FY sales_history resweep every day.
 REM
 REM  All output is appended to logs\audit.log.
 REM
-REM  Scheduled as SYSTEM (see CLAUDE.md for the schtasks command) — git
-REM  auth still works under SYSTEM because the PAT is embedded directly in
-REM  the remote URL (.git/config), not stored in a per-user credential
-REM  vault that SYSTEM wouldn't have access to.
+REM  Scheduled as SYSTEM (see CLAUDE.md for the schtasks command). NOTE:
+REM  remotes no longer have a PAT embedded in the URL (removed 28-Sep-2026 —
+REM  never put a token in a remote URL / .git/config again) and now
+REM  authenticate via Git Credential Manager instead. This may or may not
+REM  work under SYSTEM's own credential store — see CLAUDE.md's "Open
+REM  question" note on this. If git pull starts failing here, that's why.
 REM ─────────────────────────────────────────────────────────────────────
 
 setlocal
