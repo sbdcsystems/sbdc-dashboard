@@ -27,13 +27,28 @@ tally_sync_runner.py, see CLAUDE.md) against Supabase for:
     against it catches real staleness/drift without re-litigating that
     known, accepted gap.
 
+    The PRIMARY outstanding comparison reads the exact Bills Receivable
+    snapshot (tally_outstanding_*.xml) the sync itself just saved — not a
+    separate live fetch — so both sides reflect the literal same read,
+    eliminating (not just narrowing) the sync-vs-audit race. Confirmed live
+    28-Sep-2026 during busy billing: comparing against a fresh live fetch
+    instead produced +/- Rs 3k-20k per-staff diffs purely from entries made
+    in the ~2 minutes between the sync's fetch and audit.py's own. A
+    separate live-Tally comparison is still run and shown, but marked
+    informational — it can fail without affecting overall_pass.
+
 Sales/collections voucher fetches skip Tally's empty placeholder
 <VOUCHER></VOUCHER> (confirmed live 28-Sep-2026 — every Collection response
 includes one with no date/number/amount, which was inflating every count by
 exactly 1), and treat any voucher newer than the last sync's own AlterID
 threshold (read from sync_state.json) as "pending" rather than a mismatch —
 it genuinely can't be in Supabase yet if it was created after the sync
-already ran. Pending vouchers are reported, not counted as a FAIL.
+already ran. A pending voucher is excluded from BOTH the Tally side and the
+Supabase side of the comparison (confirmed live 28-Sep-2026: excluding it
+from only the Tally side produced a fake diff exactly equal to that
+voucher's amount, in cases where a concurrent regular sync run had already
+written it into Supabase between this script's own Tally-side and
+Supabase-side fetches). Pending vouchers are reported, not counted as a FAIL.
 
 Prints a PASS/FAIL table and writes one row to audit_results (best-effort —
 see CLAUDE.md for the table's GRANT/RLS setup; a missing table must not
@@ -99,6 +114,7 @@ _BILL_RE = re.compile(
 _CREDIT_VCH_TYPES = {"Payment", "Receipt"}
 
 PASS_TOLERANCE_RUPEES = 1.0  # rounding noise only, not a real mismatch
+OUTSTANDING_SNAPSHOT_MAX_AGE_MINUTES = 30.0  # older than this, don't trust it as "the same moment" the sync ran
 
 
 def _fy_start(today: date) -> date:
@@ -239,6 +255,7 @@ def fetch_tally_sales(from_date: date, to_date: date, alterid_threshold: int) ->
     vouchers = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
     total, count = 0.0, 0
     pending_total, pending_count = 0.0, 0
+    pending_voucher_numbers = set()
     for v in vouchers:
         date_m = re.search(r"<DATE\b[^>]*>(.*?)</DATE>", v)
         vnum_m = re.search(r"<VOUCHERNUMBER\b[^>]*>(.*?)</VOUCHERNUMBER>", v)
@@ -251,13 +268,19 @@ def fetch_tally_sales(from_date: date, to_date: date, alterid_threshold: int) ->
             amt = abs(float(amt_m.group(1)))
         except ValueError:
             continue
+        vnum = html.unescape(vnum_m.group(1).strip())
         if alterid_threshold and _voucher_alterid(v) > alterid_threshold:
             pending_total += amt
             pending_count += 1
+            pending_voucher_numbers.add(vnum)
             continue
         total += amt
         count += 1
-    return {"total": total, "count": count, "pending_total": pending_total, "pending_count": pending_count}
+    return {
+        "total": total, "count": count,
+        "pending_total": pending_total, "pending_count": pending_count,
+        "pending_voucher_numbers": pending_voucher_numbers,
+    }
 
 
 def fetch_tally_collections(from_date: date, to_date: date, customer_names: set, alterid_threshold: int) -> dict:
@@ -273,6 +296,7 @@ def fetch_tally_collections(from_date: date, to_date: date, customer_names: set,
     vouchers = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
     total, count = 0.0, 0
     pending_total, pending_count = 0.0, 0
+    pending_voucher_numbers = set()
     for v in vouchers:
         date_m  = re.search(r"<DATE\b[^>]*>(.*?)</DATE>", v)
         vnum_m  = re.search(r"<VOUCHERNUMBER\b[^>]*>(.*?)</VOUCHERNUMBER>", v)
@@ -289,35 +313,34 @@ def fetch_tally_collections(from_date: date, to_date: date, customer_names: set,
             amt = abs(float(amt_m.group(1)))
         except ValueError:
             continue
+        vnum = html.unescape(vnum_m.group(1).strip())
         if alterid_threshold and _voucher_alterid(v) > alterid_threshold:
             pending_total += amt
             pending_count += 1
+            pending_voucher_numbers.add(vnum)
             continue
         total += amt
         count += 1
-    return {"total": total, "count": count, "pending_total": pending_total, "pending_count": pending_count}
+    return {
+        "total": total, "count": count,
+        "pending_total": pending_total, "pending_count": pending_count,
+        "pending_voucher_numbers": pending_voucher_numbers,
+    }
 
 
-def fetch_tally_bills_receivable(fy_start: date, today: date, staff_by_name: dict) -> dict:
+def _parse_bills_receivable_xml(xml_text: str, staff_by_name: dict) -> dict:
     """
-    Fetches the same report, and applies the same on-account-credit sign
-    convention (Payment/Receipt bill types negate the amount), as
-    tally_sync_runner.py's Step 2/3 — see the module docstring for why this
-    replaces the earlier ClosingBalance-based check. Sums are SIGNED (not
-    abs), matching how the `outstanding` table's own pending_amount is
-    stored and how outstanding_by_staff_summary sums it — an on-account
-    credit legitimately nets a customer's/staff's total down, sometimes
-    below zero (e.g. an "Unassigned" bucket can be negative).
+    Shared parser for both the live fetch and the saved-snapshot-file path
+    below. Applies the same on-account-credit sign convention (Payment/
+    Receipt bill types negate the amount) as tally_sync_runner.py's Step
+    2/3 — see the module docstring for why Bills Receivable replaces the
+    earlier ClosingBalance-based check. Sums are SIGNED (not abs), matching
+    how the `outstanding` table's own pending_amount is stored and how
+    outstanding_by_staff_summary sums it — an on-account credit legitimately
+    nets a customer's/staff's total down, sometimes below zero (e.g. an
+    "Unassigned" bucket can be negative).
     """
-    r = requests.post(
-        TALLY_URL, data=_build_bills_receivable_request(fy_start, today).encode("utf-8"),
-        headers={"Content-Type": "text/xml"}, timeout=BILLS_RECEIVABLE_TIMEOUT,
-    )
-    if len(r.content) < 200:
-        raise RuntimeError(f"Tally returned only {len(r.content)} bytes for Bills Receivable — is the correct company open?")
-    xml = r.content.decode("utf-8", errors="replace")
-
-    matches = _BILL_RE.findall(xml)
+    matches = _BILL_RE.findall(xml_text)
     if not matches:
         raise RuntimeError("No bill entries found in Bills Receivable XML — structure may have changed.")
 
@@ -335,32 +358,109 @@ def fetch_tally_bills_receivable(fy_start: date, today: date, staff_by_name: dic
     return {"total": total, "by_staff": by_staff}
 
 
+def fetch_tally_bills_receivable_live(fy_start: date, today: date, staff_by_name: dict) -> dict:
+    """
+    A fresh, right-now fetch from Tally. Used as the INFORMATIONAL-only
+    comparison (see fetch_tally_bills_receivable_from_snapshot for the
+    primary, gating one) — confirmed live 28-Sep-2026 during busy billing
+    that comparing this against Supabase directly produces +/- Rs 3k-20k
+    per-staff diffs purely from invoices/payments entered in the ~2 minutes
+    between the sync's own Bills Receivable fetch and this one, with no
+    real data problem behind them.
+    """
+    r = requests.post(
+        TALLY_URL, data=_build_bills_receivable_request(fy_start, today).encode("utf-8"),
+        headers={"Content-Type": "text/xml"}, timeout=BILLS_RECEIVABLE_TIMEOUT,
+    )
+    if len(r.content) < 200:
+        raise RuntimeError(f"Tally returned only {len(r.content)} bytes for Bills Receivable — is the correct company open?")
+    return _parse_bills_receivable_xml(r.content.decode("utf-8", errors="replace"), staff_by_name)
+
+
+def find_latest_outstanding_snapshot(max_age_minutes: float = 30.0):
+    """
+    Finds the most recent tally_outstanding_*.xml backup written by
+    tally_sync_runner.py's Step 2 (fetch_tally_xml) — the exact file a
+    --force-outstanding sync run (see run_audit.bat) saves moments before
+    this script runs. Comparing Supabase against THIS snapshot instead of a
+    separate live fetch means both sides reflect the same Bills Receivable
+    read, eliminating the sync-vs-audit race entirely rather than just
+    narrowing its window.
+
+    Returns (path, age_minutes) or (None, None) if no backup exists at all.
+    A caller must still check age_minutes against its own freshness
+    requirement — an old file here doesn't mean today's sync didn't run,
+    it could mean this audit was invoked standalone, without run_audit.bat's
+    preceding --force-outstanding sync.
+    """
+    candidates = list(BASE_DIR.glob("tally_outstanding_*.xml"))
+    if not candidates:
+        return None, None
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    age_minutes = (time.time() - newest.stat().st_mtime) / 60
+    return newest, age_minutes
+
+
+def fetch_tally_bills_receivable_from_snapshot(path: Path, staff_by_name: dict) -> dict:
+    xml_text = path.read_text(encoding="utf-8", errors="replace")
+    return _parse_bills_receivable_xml(xml_text, staff_by_name)
+
+
 # ── Supabase-side fetches (same query logic the frontend uses) ─────────────
 
-def fetch_supabase_sales(supa, from_date: date, to_date: date) -> dict:
+def fetch_supabase_sales(supa, from_date: date, to_date: date, exclude_voucher_numbers: set = frozenset()) -> dict:
+    """
+    exclude_voucher_numbers must be the SAME set fetch_tally_sales marked
+    "pending" for this period — a pending voucher has to be excluded from
+    BOTH sides, not just the Tally side. Confirmed live 28-Sep-2026: a
+    voucher (CC-181/26-27) landed in sales_history via a concurrent regular
+    sync between this function's own Tally-side and Supabase-side fetches,
+    so excluding it only from the Tally total produced a fake diff exactly
+    equal to that voucher's amount, in the wrong direction.
+    """
     rows = []
     offset = 0
     while True:
         batch = (
-            supa.table("sales_history").select("amount")
+            supa.table("sales_history").select("amount,voucher_number")
             .gte("sale_date", from_date.isoformat()).lte("sale_date", to_date.isoformat())
             .range(offset, offset + 999).execute().data
         )
         rows.extend(batch)
         if len(batch) < 1000: break
         offset += 1000
+    if exclude_voucher_numbers:
+        rows = [r for r in rows if r["voucher_number"] not in exclude_voucher_numbers]
     total = sum(float(r["amount"] or 0) for r in rows)
     return {"total": total, "count": len(rows)}
 
 
-def fetch_supabase_collections(supa, from_date: date, to_date: date) -> dict:
+def fetch_supabase_collections(supa, from_date: date, to_date: date, exclude_voucher_numbers: set = frozenset()) -> dict:
+    """
+    Same pending-exclusion requirement as fetch_supabase_sales. Subtracts
+    any excluded item from each day's precomputed total_amount/invoice_count
+    (rather than recomputing the day's totals from items from scratch) so
+    everything else about how a day's numbers are built stays exactly as
+    sync_today_collections/_full_collections_sweep already computed it.
+    """
     rows = (
-        supa.table("daily_collections").select("total_amount,invoice_count")
+        supa.table("daily_collections").select("total_amount,invoice_count,items")
         .gte("sale_date", from_date.isoformat()).lte("sale_date", to_date.isoformat())
         .execute().data
     )
-    total = sum(float(r["total_amount"] or 0) for r in rows)
-    count = sum(r["invoice_count"] or 0 for r in rows)
+    total, count = 0.0, 0
+    for r in rows:
+        day_total = float(r["total_amount"] or 0)
+        day_count = r["invoice_count"] or 0
+        if exclude_voucher_numbers:
+            for item in (r.get("items") or []):
+                if item.get("excluded"):
+                    continue  # already not part of day_total/day_count
+                if item.get("invoice_ref") in exclude_voucher_numbers:
+                    day_total -= float(item.get("amount") or 0)
+                    day_count -= 1
+        total += day_total
+        count += day_count
     return {"total": total, "count": count}
 
 
@@ -414,12 +514,19 @@ def fetch_supabase_outstanding(supa, staff_by_id: dict) -> dict:
 # ── Comparison + reporting ──────────────────────────────────────────────────
 
 def _cmp(label: str, tally_val: float, supa_val: float, tally_count=None, supa_count=None,
-         pending_total: float = 0.0, pending_count: int = 0) -> dict:
+         pending_total: float = 0.0, pending_count: int = 0, informational: bool = False) -> dict:
     """
     pending_total/pending_count are vouchers newer than the sync's own
     AlterID threshold (see fetch_tally_sales/fetch_tally_collections) — they
     are NOT part of tally_val/tally_count and never affect `pass`, only
     reported for visibility ("N pending" in the printed table).
+
+    informational=True marks a check that's shown but never allowed to fail
+    the run — used for the live-Tally outstanding comparison, which is kept
+    purely for visibility once the snapshot-based comparison became the
+    primary (gating) one. `pass` is still computed honestly either way;
+    run_audit()/print_report() are what actually treat informational checks
+    as non-gating.
     """
     diff = round(tally_val - supa_val, 2)
     passed = abs(diff) <= PASS_TOLERANCE_RUPEES
@@ -438,6 +545,7 @@ def _cmp(label: str, tally_val: float, supa_val: float, tally_count=None, supa_c
         "count_diff": count_diff,
         "pending_total": round(pending_total, 2),
         "pending_count": pending_count,
+        "informational": informational,
         "pass": passed,
     }
 
@@ -480,29 +588,68 @@ def run_audit() -> dict:
     checks = []
     for period_key, (from_d, to_d) in periods.items():
         t_sales = fetch_tally_sales(from_d, to_d, sales_alterid_threshold)
-        s_sales = fetch_supabase_sales(supa, from_d, to_d)
+        s_sales = fetch_supabase_sales(supa, from_d, to_d, t_sales["pending_voucher_numbers"])
         checks.append(_cmp(
             f"sales_total[{period_key}]", t_sales["total"], s_sales["total"], t_sales["count"], s_sales["count"],
             t_sales["pending_total"], t_sales["pending_count"],
         ))
 
         t_coll = fetch_tally_collections(from_d, to_d, customer_names, coll_alterid_threshold)
-        s_coll = fetch_supabase_collections(supa, from_d, to_d)
+        s_coll = fetch_supabase_collections(supa, from_d, to_d, t_coll["pending_voucher_numbers"])
         checks.append(_cmp(
             f"collections_total[{period_key}]", t_coll["total"], s_coll["total"], t_coll["count"], s_coll["count"],
             t_coll["pending_total"], t_coll["pending_count"],
         ))
 
     staff_by_id, staff_by_name = build_staff_maps(supa)
-    t_out = fetch_tally_bills_receivable(fy_start, today, staff_by_name)
     s_out = fetch_supabase_outstanding(supa, staff_by_id)
+
+    # Primary (gating) outstanding check: compare Supabase against the exact
+    # Bills Receivable snapshot the sync itself just saved, not a separate
+    # live fetch — see find_latest_outstanding_snapshot's docstring for why.
+    # Falls back to a live fetch only if no recent snapshot exists at all
+    # (e.g. audit.py run standalone, without run_audit.bat's preceding
+    # --force-outstanding sync) — noted in `detail` either way so a human
+    # can tell which mode produced the result.
+    snapshot_path, snapshot_age_min = find_latest_outstanding_snapshot()
+    outstanding_detail = {}
+    if snapshot_path and snapshot_age_min <= OUTSTANDING_SNAPSHOT_MAX_AGE_MINUTES:
+        t_out = fetch_tally_bills_receivable_from_snapshot(snapshot_path, staff_by_name)
+        outstanding_detail["outstanding_source"] = f"snapshot:{snapshot_path.name} ({snapshot_age_min:.1f} min old)"
+    else:
+        t_out = fetch_tally_bills_receivable_live(fy_start, today, staff_by_name)
+        outstanding_detail["outstanding_source"] = (
+            "LIVE (no recent tally_outstanding_*.xml snapshot found — "
+            f"newest is {snapshot_age_min:.1f} min old)" if snapshot_path
+            else "LIVE (no tally_outstanding_*.xml snapshot exists at all)"
+        )
+
     checks.append(_cmp("outstanding_total", t_out["total"], s_out["total"]))
     all_staff = set(t_out["by_staff"]) | set(s_out["by_staff"])
     for staff in sorted(all_staff):
         checks.append(_cmp(f"outstanding_staff[{staff}]", t_out["by_staff"].get(staff, 0.0), s_out["by_staff"].get(staff, 0.0)))
 
-    overall_pass = all(c["pass"] for c in checks)
-    return {"overall_pass": overall_pass, "checks": checks, "detail": {"run_at": datetime.now(UTC).isoformat()}}
+    # Separate, informational-only live comparison — only meaningful (and
+    # only attempted) when the primary check above used the saved snapshot;
+    # if it already had to fall back to live, this would just be a duplicate.
+    if snapshot_path and snapshot_age_min <= OUTSTANDING_SNAPSHOT_MAX_AGE_MINUTES:
+        try:
+            t_out_live = fetch_tally_bills_receivable_live(fy_start, today, staff_by_name)
+            checks.append(_cmp("outstanding_total_live", t_out_live["total"], s_out["total"], informational=True))
+            all_staff_live = set(t_out_live["by_staff"]) | set(s_out["by_staff"])
+            for staff in sorted(all_staff_live):
+                checks.append(_cmp(
+                    f"outstanding_staff_live[{staff}]", t_out_live["by_staff"].get(staff, 0.0), s_out["by_staff"].get(staff, 0.0),
+                    informational=True,
+                ))
+        except Exception as exc:
+            outstanding_detail["outstanding_live_error"] = str(exc)
+
+    overall_pass = all(c["pass"] for c in checks if not c.get("informational"))
+    return {
+        "overall_pass": overall_pass, "checks": checks,
+        "detail": {"run_at": datetime.now(UTC).isoformat(), **outstanding_detail},
+    }
 
 
 def print_report(result: dict):
@@ -512,16 +659,22 @@ def print_report(result: dict):
     if not result["checks"]:
         print(f"COULD NOT RUN: {result.get('detail', {}).get('error', 'unknown error')}")
         return
+    if result.get("detail", {}).get("outstanding_source"):
+        print(f"Outstanding source: {result['detail']['outstanding_source']}")
+    if result.get("detail", {}).get("outstanding_live_error"):
+        print(f"Outstanding live (informational) comparison failed: {result['detail']['outstanding_live_error']}")
     header = f"{'Metric':<32} {'Tally':>16} {'Supabase':>16} {'Diff':>14} {'Counts (T/S)':>16}  Result  Pending"
     print(header)
     print("-" * len(header))
     for c in result["checks"]:
         counts = f"{c['tally_count']}/{c['supabase_count']}" if c["tally_count"] is not None else "—"
         status = "PASS" if c["pass"] else "FAIL"
+        if c.get("informational"):
+            status += " (info)"
         pending = f"+{c['pending_count']} (Rs {c['pending_total']:,.0f})" if c.get("pending_count") else ""
         print(f"{c['metric']:<32} {c['tally_value']:>16,.2f} {c['supabase_value']:>16,.2f} {c['diff']:>14,.2f} {counts:>16}  {status}  {pending}")
     print("-" * len(header))
-    print(f"OVERALL: {'PASS' if result['overall_pass'] else 'FAIL'}")
+    print(f"OVERALL: {'PASS' if result['overall_pass'] else 'FAIL'}", "(informational rows above never affect this)" if any(c.get("informational") for c in result["checks"]) else "")
     total_pending = sum(c.get("pending_count", 0) for c in result["checks"])
     if total_pending:
         print(f"({total_pending} voucher(s) across all checks were newer than the sync's own AlterID threshold — excluded from the comparison above as \"pending\", not a failure.)")

@@ -2641,12 +2641,18 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
     2. Step 9 vs Step 10 cross-check: if totals differ by more than ₹1,
        logs a per-voucher mismatch report pulling from daily_sales + sales_history.
 
-    Status is tri-state, not just OK/MISMATCH — if Tally can't be reached for
-    the independent count check, that is reported as UNKNOWN rather than
+    Status has four values, not just OK/MISMATCH — if Tally can't be reached
+    for the independent count check, that is reported as UNKNOWN rather than
     silently defaulting to OK. That silent-default-to-OK was the actual bug:
     the old count_ok flag started True and an exception in the count fetch
     never flipped it, so a run where Tally was unreachable for this check
-    still logged "STATUS: OK".
+    still logged "STATUS: OK". PENDING (added 28-Sep-2026) is a Step9/Step10
+    total mismatch that's fully explained by a voucher entered in the gap
+    between the two steps running (present in sales_history, not yet in
+    daily_sales.items for the same date) — confirmed live as a benign,
+    documented race (CLAUDE.md), not a real data problem. The caller's
+    `reconcile_status != "MISMATCH"` check already treats PENDING the same
+    as OK for overall_status purposes, with no call-site change needed.
 
     Only raises (fatal to the caller's try/except, logged as a warning
     upstream) on a genuine confirmed MISMATCH — never on UNKNOWN, since not
@@ -2685,9 +2691,46 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
     diff     = abs(step9_total - step10_total)
     total_ok = diff <= 1.0
 
+    # A voucher entered in the gap between Step 9 (runs first) and Step 10
+    # (runs later, same execution) fetching is a confirmed, documented,
+    # benign race — see CLAUDE.md "Confirmed live facts": on 24-Sep-2026,
+    # Step 9 saw 22 vouchers and Step 10 saw 23 because SBDC-4082/26-27 was
+    # entered in that exact gap. That shows up here as one or more vouchers
+    # present in Step 10's data (sales_history) but not Step 9's
+    # (daily_sales.items) for the same date. If those Step10-only vouchers'
+    # total fully accounts for the diff, this is late-arriving data, not a
+    # real problem — added 28-Sep-2026 after this was confirmed live to
+    # otherwise mark an entirely healthy run "partial" during busy billing.
+    pending_explained = False
+    step10_only_total = 0.0
+    step10_only_refs  = []
+    if not total_ok:
+        try:
+            supa      = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+            s9_resp   = supa.table("daily_sales").select("items").eq("sale_date", sync_date.isoformat()).execute()
+            s9_items  = (s9_resp.data[0] if s9_resp.data else {}).get("items") or []
+
+            s10_resp     = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
+            s10_by_ref   = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
+
+            s9_refs = {item.get("invoice_ref") or "" for item in s9_items}
+            for ref, s10_amt in s10_by_ref.items():
+                if ref not in s9_refs:
+                    step10_only_total += s10_amt
+                    step10_only_refs.append(ref)
+
+            if step10_total > step9_total and abs(step10_only_total - diff) <= 1.0:
+                pending_explained = True
+        except Exception as exc:
+            log.warning("[RECONCILE] Could not check for a pending-voucher explanation (non-fatal): %s", exc)
+
     if count_status == "unknown":
         status = "UNKNOWN"
-    elif count_status == "mismatch" or not total_ok:
+    elif count_status == "mismatch":
+        status = "MISMATCH"
+    elif not total_ok and pending_explained:
+        status = "PENDING"
+    elif not total_ok:
         status = "MISMATCH"
     else:
         status = "OK"
@@ -2703,36 +2746,42 @@ def reconcile_sync(sync_date: date, step9_total: float, step10_total: float, fet
     )
 
     if not total_ok:
-        log.warning(
-            "[RECONCILE] MISMATCH DETAIL — Step9 vs Step10 differ by ₹%s for %s",
-            f"{diff:,.2f}", sync_date.isoformat(),
-        )
-        try:
-            supa      = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
-            s9_resp   = supa.table("daily_sales").select("items").eq("sale_date", sync_date.isoformat()).execute()
-            s9_items  = (s9_resp.data[0] if s9_resp.data else {}).get("items") or []
+        if pending_explained:
+            log.info(
+                "[RECONCILE] PENDING — Step9/Step10 diff of ₹%s for %s fully explained by voucher(s) entered between the two steps (%s) — not a mismatch",
+                f"{diff:,.2f}", sync_date.isoformat(), ", ".join(step10_only_refs),
+            )
+        else:
+            log.warning(
+                "[RECONCILE] DIFF DETAIL — Step9 vs Step10 differ by ₹%s for %s",
+                f"{diff:,.2f}", sync_date.isoformat(),
+            )
+            try:
+                supa      = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
+                s9_resp   = supa.table("daily_sales").select("items").eq("sale_date", sync_date.isoformat()).execute()
+                s9_items  = (s9_resp.data[0] if s9_resp.data else {}).get("items") or []
 
-            s10_resp     = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
-            s10_by_ref   = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
+                s10_resp     = supa.table("sales_history").select("voucher_number, amount").eq("sale_date", sync_date.isoformat()).execute()
+                s10_by_ref   = {r["voucher_number"]: float(r["amount"] or 0) for r in (s10_resp.data or [])}
 
-            s9_refs = set()
-            for item in s9_items:
-                ref    = item.get("invoice_ref") or ""
-                s9_amt = float(item.get("amount") or 0)
-                s9_refs.add(ref)
-                s10_amt = s10_by_ref.get(ref)
-                if s10_amt is None:
-                    log.warning("[RECONCILE]   %s — Step9: ₹%s | Step10: NOT FOUND", ref, f"{s9_amt:,.2f}")
-                elif abs(s9_amt - s10_amt) > 1:
-                    log.warning(
-                        "[RECONCILE]   %s — Step9: ₹%s | Step10: ₹%s | Diff: ₹%s",
-                        ref, f"{s9_amt:,.2f}", f"{s10_amt:,.2f}", f"{abs(s9_amt - s10_amt):,.2f}",
-                    )
-            for ref, s10_amt in s10_by_ref.items():
-                if ref not in s9_refs:
-                    log.warning("[RECONCILE]   %s — Step9: NOT FOUND | Step10: ₹%s", ref, f"{s10_amt:,.2f}")
-        except Exception as exc:
-            log.warning("[RECONCILE] Could not fetch per-voucher detail: %s", exc)
+                s9_refs = set()
+                for item in s9_items:
+                    ref    = item.get("invoice_ref") or ""
+                    s9_amt = float(item.get("amount") or 0)
+                    s9_refs.add(ref)
+                    s10_amt = s10_by_ref.get(ref)
+                    if s10_amt is None:
+                        log.warning("[RECONCILE]   %s — Step9: ₹%s | Step10: NOT FOUND", ref, f"{s9_amt:,.2f}")
+                    elif abs(s9_amt - s10_amt) > 1:
+                        log.warning(
+                            "[RECONCILE]   %s — Step9: ₹%s | Step10: ₹%s | Diff: ₹%s",
+                            ref, f"{s9_amt:,.2f}", f"{s10_amt:,.2f}", f"{abs(s9_amt - s10_amt):,.2f}",
+                        )
+                for ref, s10_amt in s10_by_ref.items():
+                    if ref not in s9_refs:
+                        log.warning("[RECONCILE]   %s — Step9: NOT FOUND | Step10: ₹%s", ref, f"{s10_amt:,.2f}")
+            except Exception as exc:
+                log.warning("[RECONCILE] Could not fetch per-voucher detail: %s", exc)
 
     if count_status == "mismatch":
         raise RuntimeError(
