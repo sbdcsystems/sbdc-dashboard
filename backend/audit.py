@@ -27,6 +27,14 @@ tally_sync_runner.py, see CLAUDE.md) against Supabase for:
     against it catches real staleness/drift without re-litigating that
     known, accepted gap.
 
+Sales/collections voucher fetches skip Tally's empty placeholder
+<VOUCHER></VOUCHER> (confirmed live 28-Sep-2026 — every Collection response
+includes one with no date/number/amount, which was inflating every count by
+exactly 1), and treat any voucher newer than the last sync's own AlterID
+threshold (read from sync_state.json) as "pending" rather than a mismatch —
+it genuinely can't be in Supabase yet if it was created after the sync
+already ran. Pending vouchers are reported, not counted as a FAIL.
+
 Prints a PASS/FAIL table and writes one row to audit_results (best-effort —
 see CLAUDE.md for the table's GRANT/RLS setup; a missing table must not
 crash this script, matching the sync_status convention).
@@ -176,50 +184,118 @@ def check_tally() -> bool:
 
 # ── Tally-side fetches ───────────────────────────────────────────────────────
 
-def fetch_tally_sales(from_date: date, to_date: date) -> dict:
+def _load_sync_state() -> dict:
+    """
+    Reads sync_state.json — the same file tally_sync_runner.py writes — for
+    the AlterID thresholds the last sync run actually captured
+    (last_alterid for sales, last_receipt_alterid for collections). Lets the
+    voucher checks below tell a genuinely new voucher (created in the gap
+    between the sync finishing and this audit running a moment later) apart
+    from a real miss, instead of failing on a race condition every time.
+    Best-effort: a missing file or key means "no threshold" (0), so nothing
+    gets excluded — never a silent false PASS from a read that didn't work.
+    """
+    path = BASE_DIR / "sync_state.json"
+    if not path.exists():
+        return {}
+    try:
+        import json
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _voucher_alterid(v: str) -> int:
+    m = re.search(r"<ALTERID\b[^>]*>(.*?)</ALTERID>", v)
+    if not m:
+        return 0
+    try:
+        return int(float(m.group(1)))
+    except ValueError:
+        return 0
+
+
+def fetch_tally_sales(from_date: date, to_date: date, alterid_threshold: int) -> dict:
+    """
+    Every Collection response from this Tally install includes one empty
+    placeholder <VOUCHER></VOUCHER> with no date/number/amount — confirmed
+    live 28-Sep-2026 (counts were off by exactly 1 everywhere, including a
+    day with genuinely zero sales showing "1 invoice, Rs 0"). Skipped by
+    requiring a real voucher number, date, and parseable amount.
+
+    Vouchers with AlterID > alterid_threshold were created/edited after the
+    sync run that populated Supabase last captured its threshold — they
+    can't be in Supabase yet, so they're reported separately as "pending"
+    rather than counted as a mismatch.
+    """
     type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in SALES_VOUCHER_TYPES)
     formula = (
         f'$Date >= $$Date:"{_tally_date_literal(from_date)}" AND '
         f'$Date <= $$Date:"{_tally_date_literal(to_date)}" AND '
         f'NOT $IsCancelled AND ({type_formula})'
     )
-    xml = _post(_build_voucher_request("AuditSales", "Amount", formula))
+    xml = _post(_build_voucher_request("AuditSales", "Date,VoucherNumber,Amount,AlterID", formula))
     _raise_on_tally_error(xml)
     vouchers = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
-    total = 0.0
+    total, count = 0.0, 0
+    pending_total, pending_count = 0.0, 0
     for v in vouchers:
-        m = re.search(r"<AMOUNT\b[^>]*>(.*?)</AMOUNT>", v)
-        if m:
-            try: total += abs(float(m.group(1)))
-            except ValueError: pass
-    return {"total": total, "count": len(vouchers)}
+        date_m = re.search(r"<DATE\b[^>]*>(.*?)</DATE>", v)
+        vnum_m = re.search(r"<VOUCHERNUMBER\b[^>]*>(.*?)</VOUCHERNUMBER>", v)
+        amt_m  = re.search(r"<AMOUNT\b[^>]*>(.*?)</AMOUNT>", v)
+        if not date_m or not vnum_m or not amt_m:
+            continue
+        if not date_m.group(1).strip() or not vnum_m.group(1).strip():
+            continue
+        try:
+            amt = abs(float(amt_m.group(1)))
+        except ValueError:
+            continue
+        if alterid_threshold and _voucher_alterid(v) > alterid_threshold:
+            pending_total += amt
+            pending_count += 1
+            continue
+        total += amt
+        count += 1
+    return {"total": total, "count": count, "pending_total": pending_total, "pending_count": pending_count}
 
 
-def fetch_tally_collections(from_date: date, to_date: date, customer_names: set) -> dict:
+def fetch_tally_collections(from_date: date, to_date: date, customer_names: set, alterid_threshold: int) -> dict:
+    """Same placeholder-voucher and AlterID-pending handling as fetch_tally_sales."""
     type_formula = " OR ".join(f'$VoucherTypeName = "{t}"' for t in RECEIPT_VOUCHER_TYPES)
     formula = (
         f'$Date >= $$Date:"{_tally_date_literal(from_date)}" AND '
         f'$Date <= $$Date:"{_tally_date_literal(to_date)}" AND '
         f'NOT $IsCancelled AND ({type_formula})'
     )
-    xml = _post(_build_voucher_request("AuditColl", "PartyLedgerName,Amount", formula))
+    xml = _post(_build_voucher_request("AuditColl", "Date,VoucherNumber,PartyLedgerName,Amount,AlterID", formula))
     _raise_on_tally_error(xml)
     vouchers = re.findall(r"<VOUCHER\b.*?</VOUCHER>", xml, re.DOTALL)
     total, count = 0.0, 0
+    pending_total, pending_count = 0.0, 0
     for v in vouchers:
+        date_m  = re.search(r"<DATE\b[^>]*>(.*?)</DATE>", v)
+        vnum_m  = re.search(r"<VOUCHERNUMBER\b[^>]*>(.*?)</VOUCHERNUMBER>", v)
         party_m = re.search(r"<PARTYLEDGERNAME\b[^>]*>(.*?)</PARTYLEDGERNAME>", v)
         amt_m   = re.search(r"<AMOUNT\b[^>]*>(.*?)</AMOUNT>", v)
-        if not party_m or not amt_m:
+        if not date_m or not vnum_m or not party_m or not amt_m:
+            continue
+        if not date_m.group(1).strip() or not vnum_m.group(1).strip():
             continue
         party = html.unescape(party_m.group(1)).strip().lower()
         if party not in customer_names:
             continue  # same exclusion rule as sync_today_collections()
         try:
-            total += abs(float(amt_m.group(1)))
-            count += 1
+            amt = abs(float(amt_m.group(1)))
         except ValueError:
-            pass
-    return {"total": total, "count": count}
+            continue
+        if alterid_threshold and _voucher_alterid(v) > alterid_threshold:
+            pending_total += amt
+            pending_count += 1
+            continue
+        total += amt
+        count += 1
+    return {"total": total, "count": count, "pending_total": pending_total, "pending_count": pending_count}
 
 
 def fetch_tally_bills_receivable(fy_start: date, today: date, staff_by_name: dict) -> dict:
@@ -337,7 +413,14 @@ def fetch_supabase_outstanding(supa, staff_by_id: dict) -> dict:
 
 # ── Comparison + reporting ──────────────────────────────────────────────────
 
-def _cmp(label: str, tally_val: float, supa_val: float, tally_count=None, supa_count=None) -> dict:
+def _cmp(label: str, tally_val: float, supa_val: float, tally_count=None, supa_count=None,
+         pending_total: float = 0.0, pending_count: int = 0) -> dict:
+    """
+    pending_total/pending_count are vouchers newer than the sync's own
+    AlterID threshold (see fetch_tally_sales/fetch_tally_collections) — they
+    are NOT part of tally_val/tally_count and never affect `pass`, only
+    reported for visibility ("N pending" in the printed table).
+    """
     diff = round(tally_val - supa_val, 2)
     passed = abs(diff) <= PASS_TOLERANCE_RUPEES
     if tally_count is not None:
@@ -353,6 +436,8 @@ def _cmp(label: str, tally_val: float, supa_val: float, tally_count=None, supa_c
         "tally_count": tally_count,
         "supabase_count": supa_count,
         "count_diff": count_diff,
+        "pending_total": round(pending_total, 2),
+        "pending_count": pending_count,
         "pass": passed,
     }
 
@@ -385,15 +470,28 @@ def run_audit() -> dict:
         offset += 1000
     customer_names = {c["customer_name"].strip().lower() for c in all_customers}
 
+    # AlterID thresholds the last sync run actually captured — see
+    # _load_sync_state's docstring. A voucher newer than these is expected
+    # to be missing from Supabase (the sync hasn't seen it yet), not a bug.
+    sync_state = _load_sync_state()
+    sales_alterid_threshold = sync_state.get("last_alterid", 0)
+    coll_alterid_threshold  = sync_state.get("last_receipt_alterid", 0)
+
     checks = []
     for period_key, (from_d, to_d) in periods.items():
-        t_sales = fetch_tally_sales(from_d, to_d)
+        t_sales = fetch_tally_sales(from_d, to_d, sales_alterid_threshold)
         s_sales = fetch_supabase_sales(supa, from_d, to_d)
-        checks.append(_cmp(f"sales_total[{period_key}]", t_sales["total"], s_sales["total"], t_sales["count"], s_sales["count"]))
+        checks.append(_cmp(
+            f"sales_total[{period_key}]", t_sales["total"], s_sales["total"], t_sales["count"], s_sales["count"],
+            t_sales["pending_total"], t_sales["pending_count"],
+        ))
 
-        t_coll = fetch_tally_collections(from_d, to_d, customer_names)
+        t_coll = fetch_tally_collections(from_d, to_d, customer_names, coll_alterid_threshold)
         s_coll = fetch_supabase_collections(supa, from_d, to_d)
-        checks.append(_cmp(f"collections_total[{period_key}]", t_coll["total"], s_coll["total"], t_coll["count"], s_coll["count"]))
+        checks.append(_cmp(
+            f"collections_total[{period_key}]", t_coll["total"], s_coll["total"], t_coll["count"], s_coll["count"],
+            t_coll["pending_total"], t_coll["pending_count"],
+        ))
 
     staff_by_id, staff_by_name = build_staff_maps(supa)
     t_out = fetch_tally_bills_receivable(fy_start, today, staff_by_name)
@@ -414,15 +512,19 @@ def print_report(result: dict):
     if not result["checks"]:
         print(f"COULD NOT RUN: {result.get('detail', {}).get('error', 'unknown error')}")
         return
-    header = f"{'Metric':<32} {'Tally':>16} {'Supabase':>16} {'Diff':>14} {'Counts (T/S)':>16}  Result"
+    header = f"{'Metric':<32} {'Tally':>16} {'Supabase':>16} {'Diff':>14} {'Counts (T/S)':>16}  Result  Pending"
     print(header)
     print("-" * len(header))
     for c in result["checks"]:
         counts = f"{c['tally_count']}/{c['supabase_count']}" if c["tally_count"] is not None else "—"
         status = "PASS" if c["pass"] else "FAIL"
-        print(f"{c['metric']:<32} {c['tally_value']:>16,.2f} {c['supabase_value']:>16,.2f} {c['diff']:>14,.2f} {counts:>16}  {status}")
+        pending = f"+{c['pending_count']} (Rs {c['pending_total']:,.0f})" if c.get("pending_count") else ""
+        print(f"{c['metric']:<32} {c['tally_value']:>16,.2f} {c['supabase_value']:>16,.2f} {c['diff']:>14,.2f} {counts:>16}  {status}  {pending}")
     print("-" * len(header))
     print(f"OVERALL: {'PASS' if result['overall_pass'] else 'FAIL'}")
+    total_pending = sum(c.get("pending_count", 0) for c in result["checks"])
+    if total_pending:
+        print(f"({total_pending} voucher(s) across all checks were newer than the sync's own AlterID threshold — excluded from the comparison above as \"pending\", not a failure.)")
 
 
 def write_audit_results(result: dict):

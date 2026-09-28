@@ -61,8 +61,15 @@ cd C:\Users\vsome\Desktop\sbdc-system\backend
 #   see "Load-reduction throttles" below for exactly when each one fires.
 python tally_sync_runner.py
 
-# Force a full FY sales_history + daily_collections sweep now:
+# Force a full FY sales_history + daily_collections sweep now, AND bypass
+# the outstanding (Step 2/3) and ledger master (Step 4.5/4.6) throttles too
+# — a --full run refreshes everything right now, not just sales_history:
 python tally_sync_runner.py --full
+
+# Force just Step 2/3 (Bills Receivable) to run now, bypassing its 3h
+# throttle, without the heavier --full sweep. Used by run_audit.bat so
+# outstanding reflects the same moment audit.py fetches from Tally:
+python tally_sync_runner.py --force-outstanding
 
 # One-time fix for daily_collections rows left wrong by the pre-26-Sep-2026
 # late-entered-receipts bug — rebuilds the whole FY, month by month:
@@ -318,7 +325,7 @@ Writing to this table is best-effort (wrapped in try/except) — the sync never 
 | id | bigint identity PK | |
 | run_at | timestamptz | |
 | overall_pass | bool | true iff every check passed |
-| checks | jsonb | array of `{metric, tally_value, supabase_value, diff, tally_count, supabase_count, count_diff, pass}` — sales/collections per period (today/yesterday/last_7_days/month_to_date) + outstanding total + per-staff |
+| checks | jsonb | array of `{metric, tally_value, supabase_value, diff, tally_count, supabase_count, count_diff, pending_total, pending_count, pass}` — sales/collections per period (today/yesterday/last_7_days/month_to_date) + outstanding total + per-staff |
 | detail | jsonb | run timestamp, or an error message if Tally was unreachable |
 
 ```sql
@@ -338,7 +345,11 @@ Written by `backend/audit.py` (read-only against both Tally and Supabase; the on
 
 **Outstanding check uses Bills Receivable, NOT ledger ClosingBalance — confirmed dead end.** ClosingBalance was tried first and rejected: it times out on this Tally install for a ledger with a large bill history, and — separately — nets on-account credits differently than Bills Receivable does. Confirmed case: **Sri Bhadri Narayana Textiles** shows Rs 14,00,846 across 147 bills in Bills Receivable, but its true ledger ClosingBalance is Rs 6,06,949 — a ~Rs 7.94L gap from a pre-FY opening-balance credit that predates any Payment/Receipt voucher Bills Receivable would show. `audit.py` fetches live Bills Receivable instead (same report, same `_CREDIT_VCH_TYPES` sign convention as Step 2/3 — see the "KNOWN LIMITATION" comment above `_CREDIT_VCH_TYPES` in `tally_sync_runner.py`), since that's the dashboard's own actual source. Both sides sum **signed** pending amounts (never `abs()`) — an on-account credit legitimately nets a total down, sometimes negative (e.g. an "Unassigned" staff bucket).
 
-**Scheduling**: `backend/run_audit.bat` (mirrors `run_sync.bat` — `git pull` first, non-fatal on failure, then the audit; output appended to `backend/logs/audit.log`). Register it as a daily SYSTEM task from an elevated PowerShell/Command Prompt on the office PC:
+**Empty placeholder voucher (confirmed live 28-Sep-2026)**: every Tally Collection response for sales/collections includes one `<VOUCHER></VOUCHER>` with no date, number, or amount — this was inflating every count by exactly 1 (e.g. 16/15, 664/663, and a genuinely zero-sales day showing "1 invoice, Rs 0"). Totals were already correct (the placeholder has no `<AMOUNT>` to sum), only counts were off. Fixed by requiring a real voucher number, date, and parseable amount before counting a `<VOUCHER>` block at all.
+
+**AlterID "pending" tolerance**: a voucher created in the few seconds between the sync finishing and `audit.py` fetching from Tally moments later would otherwise show as a false FAIL — Tally has it, Supabase (correctly) doesn't yet. `audit.py` reads `sync_state.json`'s `last_alterid`/`last_receipt_alterid` (the same thresholds `tally_sync_runner.py` itself uses for AlterID-incremental sync) and excludes any fetched voucher with a higher AlterID from the pass/fail comparison, reporting it separately as "pending" in the printed table instead.
+
+**Scheduling**: `backend/run_audit.bat` (mirrors `run_sync.bat` — `git pull` first, non-fatal on failure, then **a sync with `--force-outstanding` before the audit itself, in that order** — outstanding (Step 2/3) has its own 3h throttle, so without forcing it, Supabase could be reflecting a moment up to 3h older than what Tally shows when the audit runs, and any bill entered in that gap would look like a genuine mismatch instead of the harmless timing gap it actually is; `--force-outstanding` rather than `--full` keeps this to the one throttle that matters for the audit, without a full FY sales_history resweep every day. Output appended to `backend/logs/audit.log`. Register it as a daily SYSTEM task from an elevated PowerShell/Command Prompt on the office PC:
 ```
 schtasks /create /tn "SBDC Data Audit" /tr "C:\sbdc-system\backend\run_audit.bat" /sc daily /st 12:30 /ru SYSTEM /rl HIGHEST /f
 ```
@@ -353,7 +364,7 @@ Runs as SYSTEM specifically so it's not tied to any interactive user's login ses
 | Step | Function | Description |
 |---|---|---|
 | 1 | `check_tally()` | Ping Tally HTTP API — retries up to 3× with backoff. **Always runs.** |
-| 2 | `fetch_tally_xml()` | Fetch Bills Receivable XML, save backup. **Throttled** — only if last successful run > `OUTSTANDING_THROTTLE_HOURS` (3h) old |
+| 2 | `fetch_tally_xml()` | Fetch Bills Receivable XML, save backup. **Throttled** — only if last successful run > `OUTSTANDING_THROTTLE_HOURS` (3h) old, or `--full`/`--force-outstanding` bypasses it |
 | 3 | `parse_xml()` | Parse bill entries, tag age/bucket. Runs iff Step 2 ran |
 | 4 | `reload_supabase()` | Build customer map from DB. Runs iff Step 2/3 ran |
 | **4.5** | `auto_insert_new_customers()` | Auto-insert new customers from Tally ledger master. **Throttled** with 4.6 (once a day); additionally a no-op (not a failure) on a run where Step 2/3 was itself throttled, since it needs this run's freshly parsed bills |
@@ -384,6 +395,8 @@ Steps 9, 9b, and 10 are **non-fatal** — wrapped in try/except so a Tally timeo
 The office reported Tally lagging on every connected PC — each scheduled run's heavy steps kept the shared billing PC busy 80-120s every 30 minutes. Steps 1/9/9b stay light and always run (small, filtered requests already); everything else now reuses previous data instead of refetching it, gated by how long it's actually been since it last ran. Throttle windows are constants near the top of `tally_sync_runner.py`: `OUTSTANDING_THROTTLE_HOURS` (3h), `LEDGER_MASTER_THROTTLE_HOURS` (24h), `SALES_HISTORY_FULL_SWEEP_DAYS` (7d), `FALLBACK_CURRENT_MONTH_HOURS` (2h), `FALLBACK_OLDER_MONTH_HOURS` (24h).
 
 **Due decisions read real elapsed time, not a call count** — `_is_due(iso_str, hours)` (missing/unparseable timestamp = always due) checks against `last_success.outstanding` in `last_sync_status.json` for Step 2/3, and against fields in `sync_state.json` for the ledger master and Step 10.
+
+**`--full` bypasses every throttle (28-Sep-2026), not just Step 10's sweep** — outstanding (Step 2/3) and ledger master (Step 4.5/4.6) are forced too, so a `--full` run genuinely refreshes everything right now. `--force-outstanding` is a separate, narrower flag that bypasses only the outstanding throttle (used by `run_audit.bat` — see `audit_results` above).
 
 **dry_run must never advance a throttle.** `_write_status()` only updates `last_success[step]` when `not dry_run` — a `--dry-run` test run doesn't actually write to that step's target table, so it must not count as a "last success" for throttling purposes (it would otherwise silently suppress the next `OUTSTANDING_THROTTLE_HOURS` of real outstanding syncs). Every new state write this phase added (`last_ledger_master_run`, `last_alterid`, `last_current_month_fetch_at`, `last_older_month_fetch_at`, `last_full_sales_history_sweep`) is likewise gated by `if not dry_run`. Caught by an actual `main()`-level test (mocking Tally, calling `main()` twice in a row) before shipping — worth re-running that style of test if this logic changes again, since a unit test on the helper functions alone wouldn't have caught it.
 

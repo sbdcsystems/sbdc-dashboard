@@ -2876,7 +2876,8 @@ def main():
     parser = argparse.ArgumentParser(description="SBDC Tally → Supabase sync")
     parser.add_argument("--dry-run",    action="store_true", help="Parse without DB writes")
     parser.add_argument("--from-local", action="store_true", help="Use tally_with_dates.xml instead of live Tally")
-    parser.add_argument("--full",       action="store_true", help="Force a full FY sales_history sweep + deletion reconciliation now, instead of waiting for the weekly schedule")
+    parser.add_argument("--full",       action="store_true", help="Force a full FY sales_history sweep + deletion reconciliation now, instead of waiting for the weekly schedule. Also bypasses the outstanding (Step 2/3) and ledger master (Step 4.5/4.6) throttles, so a --full run refreshes everything, not just sales_history")
+    parser.add_argument("--force-outstanding", action="store_true", help="Force Step 2/3 (Bills Receivable) to run now, bypassing the 3h throttle, without forcing the heavier --full sales_history sweep or the ledger master refresh. Used by run_audit.bat so the outstanding table reflects the same moment audit.py fetches from Tally")
     parser.add_argument("--backfill",   action="store_true", help="Backfill daily_sales/collections for a date range")
     parser.add_argument("--from",       dest="from_date", metavar="YYYY-MM-DD", help="Backfill start date (inclusive)")
     parser.add_argument("--to",         dest="to_date",   metavar="YYYY-MM-DD", help="Backfill end date (inclusive)")
@@ -2964,7 +2965,8 @@ def main():
         log.info("SUPREME BALAJI — TALLY OUTSTANDING SYNC")
         if from_local:  log.info("  MODE: FROM LOCAL FILE (no Tally connection)")
         if dry_run:     log.info("  MODE: DRY RUN (Supabase writes skipped)")
-        if args.full:   log.info("  MODE: FULL FY sales_history sweep (--full)")
+        if args.full:              log.info("  MODE: FULL FY sales_history sweep + all throttles bypassed (--full)")
+        if args.force_outstanding: log.info("  MODE: outstanding throttle bypassed (--force-outstanding)")
         log.info("  Run: %s", RUN_TS)
         log.info("=" * 60)
 
@@ -3014,9 +3016,16 @@ def main():
                 # what was keeping the shared billing PC busy.
                 prev_status      = _load_last_status()
                 last_outstanding = prev_status.get("last_success", {}).get("outstanding")
-                outstanding_due  = _is_due(last_outstanding, OUTSTANDING_THROTTLE_HOURS)
+                # --full is meant to refresh everything now, not just
+                # sales_history — and --force-outstanding exists specifically
+                # so run_audit.bat can force this step alone right before
+                # audit.py runs, so Tally and Supabase reflect the same
+                # moment (see CLAUDE.md's audit_results section).
+                outstanding_due  = args.full or args.force_outstanding or _is_due(last_outstanding, OUTSTANDING_THROTTLE_HOURS)
 
                 if outstanding_due:
+                    if not _is_due(last_outstanding, OUTSTANDING_THROTTLE_HOURS):
+                        log.info("Step 2/3 — forced (%s), ignoring the %dh throttle", "--full" if args.full else "--force-outstanding", OUTSTANDING_THROTTLE_HOURS)
                     xml_text = fetch_tally_xml()
                     bills = parse_xml(xml_text)
                     inserted, skipped, unmatched = reload_supabase(bills, dry_run=dry_run)
@@ -3034,10 +3043,12 @@ def main():
                 # need bills, so it still runs on its own schedule; 4.5
                 # (auto-insert) needs THIS run's bills to know what's new, so
                 # it's a harmless no-op — not a failure — on a run where
-                # Step 2/3 above was itself throttled.
+                # Step 2/3 above was itself throttled. --force-outstanding
+                # deliberately does NOT bypass this one — it's scoped to
+                # outstanding only; --full bypasses both.
                 run_state         = _load_state()
                 last_ledger_run   = run_state.get("last_ledger_master_run")
-                ledger_master_due = _is_due(last_ledger_run, LEDGER_MASTER_THROTTLE_HOURS)
+                ledger_master_due = args.full or _is_due(last_ledger_run, LEDGER_MASTER_THROTTLE_HOURS)
 
                 if ledger_master_due:
                     try:
