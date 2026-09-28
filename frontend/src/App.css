@@ -63,6 +63,10 @@ svg{display:block}
 .scrolled .sync-pill{opacity:1;transform:none}
 .sync-pill--stale{color:var(--orange)}
 .sync-pill i{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
+/* Always visible (unlike .sync-pill, which only fades in once scrolled) —
+   a failed daily Tally-vs-Supabase check (backend/audit.py) is worth
+   surfacing immediately, not just as a scroll-collapsed detail. */
+.audit-badge{display:inline-block;font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;white-space:nowrap;flex-shrink:0;background:color-mix(in srgb, var(--red) 16%, transparent);color:var(--red)}
 
 /* ---------- Appearance menu ---------- */
 .menu{position:fixed;z-index:40;top:56px;right:14px;width:220px;border-radius:20px;padding:6px;transform-origin:top right;animation:pop .18s cubic-bezier(.3,1.3,.5,1)}

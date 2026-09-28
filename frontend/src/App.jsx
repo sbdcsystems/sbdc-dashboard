@@ -109,12 +109,12 @@ function _cardRange(period) {
     const y = _addDaysISO(TODAY, -1)
     return { from: y, to: y }
   }
-  if (period === 'this_week') {
-    const d = _istNow()
-    const dow = d.getUTCDay()
-    d.setUTCDate(d.getUTCDate() - (dow === 0 ? 6 : dow - 1))
-    return { from: _fmtDate(d), to: TODAY }
-  }
+  // Rolling 7-day window (today + the 6 days before it), not the ISO
+  // calendar week — the old Monday-anchored version meant "this_week" on a
+  // Monday was just today alone, which is how Sold > Week and Sold > Today
+  // ended up showing different totals from different fetch times for what
+  // was effectively the same single day. Renamed "Last 7 days" in the UI.
+  if (period === 'this_week') return { from: _addDaysISO(TODAY, -6), to: TODAY }
   if (period === 'this_month') return { from: MONTH_START, to: TODAY }
   return { from: TODAY, to: TODAY }
 }
@@ -132,7 +132,7 @@ function _mergeCardRows(rows) {
 function _periodLabel(period, customDate) {
   if (period === 'custom' && customDate)
     return new Date(customDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-  return { today: 'today', yesterday: 'yesterday', this_week: 'this week', this_month: 'this month' }[period] || 'selected period'
+  return { today: 'today', yesterday: 'yesterday', this_week: 'the last 7 days', this_month: 'this month' }[period] || 'selected period'
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -386,8 +386,8 @@ const CustomersList = memo(function CustomersList({ customers, highlightedId, on
 // rather than being re-rendered and reconciled for nothing.
 const OverviewPage = memo(function OverviewPage({
   summary, presentRatio, agingTotal,
-  salesCardPeriod, salesPickerOpen, salesCustomDate, salesCardLoading, salesDisplayData, salesHasDetail, visibleSalesItems, sortedSalesItems, showAllSales,
-  collCardPeriod, collPickerOpen, collCustomDate, collCardLoading, collDisplayData, collectionsHasDetail, sortedCollectionItems,
+  salesCardPeriod, salesPickerOpen, salesCustomDate, salesDisplayData, salesHasDetail, visibleSalesItems, sortedSalesItems, showAllSales, syncedToday,
+  collCardPeriod, collPickerOpen, collCustomDate, collDisplayData, collectionsHasDetail, sortedCollectionItems,
   lastCollectionDate, collectionsStale,
   staffSummary, maxStaffPending,
   salesChartPeriod, hasSalesHistory, chartData, periodTotal, periodCount, chartPalette,
@@ -430,7 +430,7 @@ const OverviewPage = memo(function OverviewPage({
           </div>
           <div className="seg-row">
             <div className="seg" role="group" aria-label="Sales period">
-              {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Week'], ['this_month', 'Month']].map(([p, lbl]) => (
+              {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Last 7 days'], ['this_month', 'Month']].map(([p, lbl]) => (
                 <button key={p} aria-pressed={salesCardPeriod === p} onClick={() => onSalesPeriod(p)}>{lbl}</button>
               ))}
             </div>
@@ -444,53 +444,48 @@ const OverviewPage = memo(function OverviewPage({
             <input type="date" className="seg-date" style={{ width: '100%', marginTop: 6 }} value={salesCustomDate} max={TODAY} onChange={e => onSalesCustomDate(e.target.value)} />
           )}
 
-          {salesCardLoading ? (
-            <div className="card-skeleton"><div className="skeleton skeleton--figure" /><div className="skeleton skeleton--line" /></div>
-          ) : (
-            <div key={salesCardPeriod + salesCustomDate} className="card-fade">
-              {salesDisplayData ? (
-                <>
-                  <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(salesDisplayData.total_amount)}</span></div>
-                  <p className="msub">
-                    <strong>{salesDisplayData.invoice_count}</strong>{' '}
-                    {salesDisplayData.invoice_count === 1 ? 'invoice' : 'invoices'}
-                    {['today', 'yesterday', 'custom'].includes(salesCardPeriod) && salesDisplayData.synced_at && (
-                      <> · synced {new Date(salesDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</>
-                    )}
-                  </p>
-                  {salesHasDetail && (
-                    <div className="list plain" style={{ marginTop: 12 }}>
-                      {visibleSalesItems.map((item, idx) => {
-                        const cid      = item.customer_id
-                        const nameKey  = item.customer_name?.trim().toLowerCase()
-                        const staff    = (cid != null ? staffById[cid]  : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
-                        const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
-                        return (
-                          <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
-                            <span className="body">
-                              <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => onOpenCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
-                              <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
-                            </span>
-                            <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
-                          </div>
-                        )
-                      })}
-                      {sortedSalesItems.length > 10 && (
-                        <button className="sf link" style={{ padding: '10px 0 0' }} onClick={() => onToggleShowAllSales(v => !v)}>
-                          {showAllSales ? 'Show top 10' : `Show all ${sortedSalesItems.length} invoices`}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                  {!salesHasDetail && <p className="msub">Per-invoice breakdown not available from this Tally export</p>}
-                </>
-              ) : (
+          <div key={salesCardPeriod + salesCustomDate} className="card-fade">
+            {salesDisplayData.invoice_count > 0 ? (
+              <>
+                <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(salesDisplayData.total_amount)}</span></div>
                 <p className="msub">
-                  {salesCardPeriod === 'today' ? "No data yet — sync hasn't run today" : `No data for ${_periodLabel(salesCardPeriod, salesCustomDate)}`}
+                  <strong>{salesDisplayData.invoice_count}</strong>{' '}
+                  {salesDisplayData.invoice_count === 1 ? 'invoice' : 'invoices'}
                 </p>
-              )}
-            </div>
-          )}
+                {salesHasDetail && (
+                  <div className="list plain" style={{ marginTop: 12 }}>
+                    {visibleSalesItems.map((item, idx) => {
+                      const cid      = item.customer_id
+                      const nameKey  = item.customer_name?.trim().toLowerCase()
+                      const staff    = (cid != null ? staffById[cid]  : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
+                      const cust     = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
+                      return (
+                        <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
+                          <span className="body">
+                            <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => onOpenCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
+                            <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
+                          </span>
+                          <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
+                        </div>
+                      )
+                    })}
+                    {sortedSalesItems.length > 10 && (
+                      <button className="sf link" style={{ padding: '10px 0 0' }} onClick={() => onToggleShowAllSales(v => !v)}>
+                        {showAllSales ? 'Show top 10' : `Show all ${sortedSalesItems.length} invoices`}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {!salesHasDetail && <p className="msub">Per-invoice breakdown not available from this Tally export</p>}
+              </>
+            ) : (
+              <p className="msub">
+                {salesCardPeriod === 'today' && !syncedToday
+                  ? "No data yet — sync hasn't run today"
+                  : `No data for ${_periodLabel(salesCardPeriod, salesCustomDate)}`}
+              </p>
+            )}
+          </div>
         </section>
 
         {/* Collections */}
@@ -500,7 +495,7 @@ const OverviewPage = memo(function OverviewPage({
           </div>
           <div className="seg-row">
             <div className="seg" role="group" aria-label="Collections period">
-              {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Week'], ['this_month', 'Month']].map(([p, lbl]) => (
+              {[['today', 'Today'], ['yesterday', 'Yesterday'], ['this_week', 'Last 7 days'], ['this_month', 'Month']].map(([p, lbl]) => (
                 <button key={p} aria-pressed={collCardPeriod === p} onClick={() => onCollPeriod(p)}>{lbl}</button>
               ))}
             </div>
@@ -514,57 +509,50 @@ const OverviewPage = memo(function OverviewPage({
             <input type="date" className="seg-date" style={{ width: '100%', marginTop: 6 }} value={collCustomDate} max={TODAY} onChange={e => onCollCustomDate(e.target.value)} />
           )}
 
-          {collCardLoading ? (
-            <div className="card-skeleton"><div className="skeleton skeleton--figure" /><div className="skeleton skeleton--line" /></div>
-          ) : (
-            <div key={collCardPeriod + collCustomDate} className="card-fade">
-              {collDisplayData ? (
-                collDisplayData.invoice_count === 0 ? (
-                  <p className="msub" style={{ marginTop: 12 }}>
-                    {collCardPeriod === 'today'
-                      ? 'Not entered yet. Payments are usually entered a day or two later.'
-                      : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
-                  </p>
-                ) : (
-                  <>
-                    <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(collDisplayData.total_amount)}</span></div>
-                    <p className="msub">
-                      <strong>{collDisplayData.invoice_count}</strong>{' '}
-                      {collDisplayData.invoice_count === 1 ? 'receipt' : 'receipts'}
-                      {['today', 'yesterday', 'custom'].includes(collCardPeriod) && collDisplayData.synced_at && (
-                        <> · synced {new Date(collDisplayData.synced_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</>
-                      )}
-                    </p>
-                    {collectionsHasDetail ? (
-                      <div className="list plain" style={{ marginTop: 12 }}>
-                        {sortedCollectionItems.map((item, idx) => {
-                          const cid     = item.customer_id
-                          const nameKey = item.customer_name?.trim().toLowerCase()
-                          const staff   = (cid != null ? staffById[cid] : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
-                          const cust    = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
-                          return (
-                            <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
-                              <span className="body">
-                                <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => onOpenCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
-                                <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
-                              </span>
-                              <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ) : (
-                      <p className="msub">Per-receipt breakdown not available from this Tally export</p>
-                    )}
-                  </>
-                )
-              ) : (
+          <div key={collCardPeriod + collCustomDate} className="card-fade">
+            {collDisplayData ? (
+              collDisplayData.invoice_count === 0 ? (
                 <p className="msub" style={{ marginTop: 12 }}>
-                  {collCardPeriod === 'today' ? "No collections yet today — sync hasn't run" : `No data for ${_periodLabel(collCardPeriod, collCustomDate)}`}
+                  {collCardPeriod === 'today'
+                    ? 'Not entered yet. Payments are usually entered a day or two later.'
+                    : `No collections received ${_periodLabel(collCardPeriod, collCustomDate)}`}
                 </p>
-              )}
-            </div>
-          )}
+              ) : (
+                <>
+                  <div className="mval" style={{ marginTop: 12 }}><span className="big">{formatINR(collDisplayData.total_amount)}</span></div>
+                  <p className="msub">
+                    <strong>{collDisplayData.invoice_count}</strong>{' '}
+                    {collDisplayData.invoice_count === 1 ? 'receipt' : 'receipts'}
+                  </p>
+                  {collectionsHasDetail ? (
+                    <div className="list plain" style={{ marginTop: 12 }}>
+                      {sortedCollectionItems.map((item, idx) => {
+                        const cid     = item.customer_id
+                        const nameKey = item.customer_name?.trim().toLowerCase()
+                        const staff   = (cid != null ? staffById[cid] : undefined) ?? staffByName[nameKey] ?? 'Unassigned'
+                        const cust    = (cid != null ? customersById[cid] : null) ?? customerByName[nameKey]
+                        return (
+                          <div className="item" key={idx} style={{ minHeight: 44, padding: '7px 0' }}>
+                            <span className="body">
+                              <div className={'t1' + (cust ? ' link' : '')} onClick={cust ? () => onOpenCustomer(cust) : undefined}>{item.customer_name || '—'}</div>
+                              <div className="t2">{staff}{item.invoice_ref ? ` · ${item.invoice_ref}` : ''}</div>
+                            </span>
+                            <span className="val"><div className="v">{formatINR(item.amount)}</div></span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <p className="msub">Per-receipt breakdown not available from this Tally export</p>
+                  )}
+                </>
+              )
+            ) : (
+              <p className="msub" style={{ marginTop: 12 }}>
+                {collCardPeriod === 'today' ? "No collections yet today — sync hasn't run" : `No data for ${_periodLabel(collCardPeriod, collCustomDate)}`}
+              </p>
+            )}
+          </div>
         </section>
 
         {/* Collections status — calm by default; the office normally batch-enters
@@ -728,10 +716,16 @@ export default function App() {
   const [customers, setCustomers] = useState([])
   const [searchQuery, setSearchQuery] = useState('')
   const [staffFilter, setStaffFilter] = useState(null)
-  const [todaySales, setTodaySales]               = useState(null)
-  const [todayCollections, setTodayCollections]   = useState(null)
   const [showAllSales, setShowAllSales] = useState(false)
   const [salesHistory, setSalesHistory] = useState([])
+  // Full-FY daily_collections rows (not just today) — the single source for
+  // every Received period, same as salesHistory is for Sold. See "ONE
+  // source" fix, 28-Sep-2026: Sold/Received used to read daily_sales/
+  // daily_collections per-period, but daily_sales only ever had rows going
+  // back to whenever the daily sync actually started writing it (24-Sep),
+  // never backfilled — so "Month" silently showed 4 days' worth. Both cards
+  // now read from complete, already-fully-fetched history arrays instead.
+  const [collectionsHistory, setCollectionsHistory] = useState([])
   const [salesChartPeriod, setSalesChartPeriod] = useState('this_month')
   const [globalSearch, setGlobalSearch]           = useState('')
   const [searchOpen, setSearchOpen]               = useState(false)
@@ -741,20 +735,23 @@ export default function App() {
   const [custDetailLoading, setCustDetailLoading] = useState(false)
 
   const [salesCardPeriod, setSalesCardPeriod] = useState('today')
-  const [salesCardLoading, setSalesCardLoading] = useState(false)
-  const [salesCardRows, setSalesCardRows] = useState(null)
   const [salesPickerOpen, setSalesPickerOpen] = useState(false)
   const [salesCustomDate, setSalesCustomDate] = useState('')
   const [collCardPeriod, setCollCardPeriod] = useState('today')
-  const [collCardLoading, setCollCardLoading] = useState(false)
-  const [collCardRows, setCollCardRows] = useState(null)
   const [collPickerOpen, setCollPickerOpen] = useState(false)
   const [collCustomDate, setCollCustomDate] = useState('')
 
-  // Sync health + last-real-receipt date — both best-effort (non-fatal if the
-  // sync_status table doesn't exist yet, or daily_collections has no rows).
+  // Sync health — best-effort (non-fatal if the sync_status table doesn't
+  // exist yet). This is now the ONE "last synced" time shown anywhere on the
+  // dashboard — see "ONE source" fix, 28-Sep-2026 (previously the Sold/
+  // Received cards additionally showed their own per-row synced_at, which
+  // could legitimately be a different hour than this header pill).
   const [lastSync, setLastSync]                   = useState(null)
-  const [lastCollectionDate, setLastCollectionDate] = useState(null)
+  // Latest backend/audit.py result — best-effort (non-fatal if audit_results
+  // doesn't exist yet, or no audit has ever run). See CLAUDE.md's "ONE
+  // source" fix section: the permanent safety net against Sold/Received (or
+  // outstanding) silently drifting from what Tally actually shows.
+  const [auditFailed, setAuditFailed]             = useState(false)
 
   // Appearance (Automatic / Light / Dark), scroll-collapsed title, menus
   const [theme, setTheme] = useState(() => {
@@ -810,37 +807,29 @@ export default function App() {
           { data: bucketRows,      error: e2 },
           { data: flaggedRows,     error: e3 },
           { data: staffRows,       error: e4 },
-          { data: salesRow,        error: e6 },
-          { data: collectionsRow,  error: e7 },
           { data: syncRows },
-          { data: recentCollRows },
+          { data: auditRows },
         ] = await Promise.all([
           supabase.from('outstanding_status_summary').select('*'),
           supabase.from('outstanding_bucket_summary').select('*'),
           supabase.from('flagged_customers_summary').select('*'),
           supabase.from('outstanding_by_staff_summary').select('*'),
-          supabase.from('daily_sales').select('*').eq('sale_date', TODAY).maybeSingle(),
-          supabase.from('daily_collections').select('*').eq('sale_date', TODAY).maybeSingle(),
           // Best-effort: sync_status may not exist yet (see CLAUDE.md — needs its
           // CREATE TABLE + GRANT run once). No `error` destructured — a missing
           // table must not fail the whole dashboard load.
           supabase.from('sync_status').select('run_at,status').eq('status', 'success').order('run_at', { ascending: false }).limit(1),
-          // Lookback window to find the last day with a real receipt, for the
-          // "no payments recorded" notice.
-          supabase.from('daily_collections').select('sale_date,invoice_count').gte('sale_date', _addDaysISO(TODAY, -30)).lte('sale_date', TODAY).order('sale_date', { ascending: false }),
+          // Same best-effort treatment — audit_results is written by
+          // backend/audit.py and may not exist yet either.
+          supabase.from('audit_results').select('overall_pass').order('run_at', { ascending: false }).limit(1),
         ])
 
         if (e1) throw e1
         if (e2) throw e2
         if (e3) throw e3
         if (e4) throw e4
-        // e6 is non-fatal — table may not exist yet
 
         if (syncRows && syncRows.length) setLastSync(syncRows[0])
-        if (recentCollRows) {
-          const lastReal = recentCollRows.find(r => (r.invoice_count || 0) > 0)
-          if (lastReal) setLastCollectionDate(lastReal.sale_date)
-        }
+        if (auditRows && auditRows.length) setAuditFailed(auditRows[0].overall_pass === false)
 
         const recentRow = statusRows.find(r => r.age_status === 'recent') || {}
         const staleRow  = statusRows.find(r => r.age_status === 'stale')  || {}
@@ -877,23 +866,6 @@ export default function App() {
             .sort((a, b) => b.total_pending - a.total_pending)
         )
 
-        if (!e6 && salesRow) {
-          setTodaySales({
-            total_amount:  Number(salesRow.total_amount) || 0,
-            invoice_count: salesRow.invoice_count || 0,
-            synced_at:     salesRow.synced_at,
-            items:         Array.isArray(salesRow.items) ? salesRow.items : [],
-          })
-        }
-        if (!e7 && collectionsRow) {
-          setTodayCollections({
-            total_amount:  Number(collectionsRow.total_amount) || 0,
-            invoice_count: collectionsRow.invoice_count || 0,
-            synced_at:     collectionsRow.synced_at,
-            items:         Array.isArray(collectionsRow.items) ? collectionsRow.items : [],
-          })
-        }
-
         // Paginated customer fetch — 1067 customers, PostgREST caps at 1000/request
         {
           const PAGE_C = 1000
@@ -921,14 +893,18 @@ export default function App() {
           )
         }
 
-        // Paginated fetch — PostgREST hard-caps at 1000 rows per request
+        // Paginated fetch — PostgREST hard-caps at 1000 rows per request.
+        // Also the ONE source for the Sold card's Today/Yesterday/Last 7
+        // days/Month/custom periods now (see "ONE source" fix, 28-Sep-2026)
+        // — customer_id/voucher_number added so the card's per-invoice list
+        // can link to a customer and show the invoice ref, same as before.
         const PAGE = 1000
         let allHistory = []
         let hOffset = 0
         while (true) {
           const { data: page, error: hErr } = await supabase
             .from('sales_history')
-            .select('sale_date,customer_name,amount')
+            .select('sale_date,customer_name,customer_id,voucher_number,amount')
             .gte('sale_date', FY_START)
             .order('sale_date', { ascending: true })
             .range(hOffset, hOffset + PAGE - 1)
@@ -939,6 +915,30 @@ export default function App() {
         }
         if (allHistory.length > 0) {
           setSalesHistory(allHistory.map(s => ({ ...s, amount: Number(s.amount) || 0 })))
+        }
+
+        // Same idea for Received — the ONE source for every collections
+        // period, not just a per-period re-query against daily_collections.
+        let allDailyColl = []
+        let dOffset = 0
+        while (true) {
+          const { data: page, error: dErr } = await supabase
+            .from('daily_collections')
+            .select('sale_date,total_amount,invoice_count,items')
+            .gte('sale_date', FY_START)
+            .order('sale_date', { ascending: true })
+            .range(dOffset, dOffset + PAGE - 1)
+          if (dErr || !page) break
+          allDailyColl = allDailyColl.concat(page)
+          if (page.length < PAGE) break
+          dOffset += PAGE
+        }
+        if (allDailyColl.length > 0) {
+          setCollectionsHistory(allDailyColl.map(r => ({
+            ...r,
+            total_amount: Number(r.total_amount) || 0,
+            items: Array.isArray(r.items) ? r.items : [],
+          })))
         }
       } catch (e) {
         setError(e.message || 'Could not load dashboard data.')
@@ -1105,46 +1105,28 @@ export default function App() {
   // passed as props into the now-memoized CustomersList/OverviewPage
   // components below; without a stable reference, React.memo's prop
   // comparison would fail every render and defeat the memoization.
-  const handleSalesPeriod = useCallback(async (period) => {
+  // Switching periods used to re-query daily_sales/daily_collections live —
+  // now it's just picking which slice of the already-fetched salesHistory/
+  // collectionsHistory arrays to look at (see "ONE source" fix, 28-Sep-2026),
+  // so these are synchronous and instant; no loading state needed any more.
+  const handleSalesPeriod = useCallback((period) => {
     setSalesCardPeriod(period)
     if (period !== 'custom') setSalesPickerOpen(false)
-    if (period === 'today') { setSalesCardRows(null); return }
-    const { from, to } = _cardRange(period)
-    setSalesCardLoading(true)
-    const { data } = await supabase.from('daily_sales').select('*').gte('sale_date', from).lte('sale_date', to)
-    setSalesCardRows(data || [])
-    setSalesCardLoading(false)
   }, [])
 
-  const handleSalesCustomDate = useCallback(async (dateStr) => {
+  const handleSalesCustomDate = useCallback((dateStr) => {
     setSalesCustomDate(dateStr)
-    if (!dateStr) return
-    setSalesCardPeriod('custom')
-    setSalesCardLoading(true)
-    const { data } = await supabase.from('daily_sales').select('*').eq('sale_date', dateStr)
-    setSalesCardRows(data || [])
-    setSalesCardLoading(false)
+    if (dateStr) setSalesCardPeriod('custom')
   }, [])
 
-  const handleCollPeriod = useCallback(async (period) => {
+  const handleCollPeriod = useCallback((period) => {
     setCollCardPeriod(period)
     if (period !== 'custom') setCollPickerOpen(false)
-    if (period === 'today') { setCollCardRows(null); return }
-    const { from, to } = _cardRange(period)
-    setCollCardLoading(true)
-    const { data } = await supabase.from('daily_collections').select('*').gte('sale_date', from).lte('sale_date', to)
-    setCollCardRows(data || [])
-    setCollCardLoading(false)
   }, [])
 
-  const handleCollCustomDate = useCallback(async (dateStr) => {
+  const handleCollCustomDate = useCallback((dateStr) => {
     setCollCustomDate(dateStr)
-    if (!dateStr) return
-    setCollCardPeriod('custom')
-    setCollCardLoading(true)
-    const { data } = await supabase.from('daily_collections').select('*').eq('sale_date', dateStr)
-    setCollCardRows(data || [])
-    setCollCardLoading(false)
+    if (dateStr) setCollCardPeriod('custom')
   }, [])
 
   const handleSearchResult = useCallback((customer) => {
@@ -1200,14 +1182,78 @@ export default function App() {
     sheetDragStartY.current = null
   }
 
-  const salesDisplayData = useMemo(() => salesCardRows !== null ? _mergeCardRows(salesCardRows) : todaySales, [salesCardRows, todaySales])
-  const collDisplayData  = useMemo(() => collCardRows  !== null ? _mergeCardRows(collCardRows)  : todayCollections, [collCardRows, todayCollections])
+  // ── Sold/Received cards — ONE source, 28-Sep-2026 ───────────────────────────
+  // Both used to re-query daily_sales/daily_collections per period. daily_sales
+  // only ever has rows going back to whenever the daily sync actually started
+  // writing it (24-Sep — never backfilled for 1-23 Sep), so "Month" silently
+  // summed 4 days instead of the real ~28. Switching periods is now a
+  // client-side filter over salesHistory/collectionsHistory — the same
+  // complete, whole-FY arrays already fetched once at mount — so every period
+  // (including Today) reads the identical data as of the same page load, and
+  // can never disagree with each other or with the FY chart below.
+  const salesRangeForPeriod = useMemo(() => {
+    if (salesCardPeriod === 'custom') return salesCustomDate ? { from: salesCustomDate, to: salesCustomDate } : null
+    return _cardRange(salesCardPeriod)
+  }, [salesCardPeriod, salesCustomDate])
 
-  const sortedSalesItems      = useMemo(() => [...(salesDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount), [salesDisplayData])
-  const visibleSalesItems     = useMemo(() => showAllSales ? sortedSalesItems : sortedSalesItems.slice(0, 10), [showAllSales, sortedSalesItems])
-  const salesHasDetail        = useMemo(() => sortedSalesItems.some(i => i.customer_name || i.invoice_ref), [sortedSalesItems])
+  const salesCardItems = useMemo(() => {
+    if (!salesRangeForPeriod) return []
+    return salesHistory
+      .filter(s => s.sale_date >= salesRangeForPeriod.from && s.sale_date <= salesRangeForPeriod.to)
+      .map(s => ({ customer_name: s.customer_name, customer_id: s.customer_id, invoice_ref: s.voucher_number, amount: s.amount }))
+  }, [salesHistory, salesRangeForPeriod])
+
+  const salesDisplayData = useMemo(() => {
+    if (!salesRangeForPeriod) return null
+    return {
+      total_amount:  salesCardItems.reduce((s, i) => s + i.amount, 0),
+      invoice_count: salesCardItems.length,
+    }
+  }, [salesCardItems, salesRangeForPeriod])
+
+  // sales_history has no reliable "we checked today and found zero" signal
+  // the way daily_sales used to (that table always wrote a row, even a zero
+  // one) — so for "no invoices today" specifically, fall back to whether
+  // today's sync has actually completed yet (lastSync) to pick the right
+  // message, instead of guessing from row presence alone.
+  const syncedToday = useMemo(() => {
+    if (!lastSync?.run_at) return false
+    const ist = new Date(new Date(lastSync.run_at).getTime() + 330 * 60 * 1000)
+    return _fmtDate(ist) === TODAY
+  }, [lastSync])
+
+  const sortedSalesItems  = useMemo(() => [...salesCardItems].sort((a, b) => b.amount - a.amount), [salesCardItems])
+  const visibleSalesItems = useMemo(() => showAllSales ? sortedSalesItems : sortedSalesItems.slice(0, 10), [showAllSales, sortedSalesItems])
+  const salesHasDetail    = useMemo(() => sortedSalesItems.some(i => i.customer_name || i.invoice_ref), [sortedSalesItems])
+
+  const collRangeForPeriod = useMemo(() => {
+    if (collCardPeriod === 'custom') return collCustomDate ? { from: collCustomDate, to: collCustomDate } : null
+    return _cardRange(collCardPeriod)
+  }, [collCardPeriod, collCustomDate])
+
+  const collCardDays = useMemo(() => {
+    if (!collRangeForPeriod) return []
+    return collectionsHistory.filter(r => r.sale_date >= collRangeForPeriod.from && r.sale_date <= collRangeForPeriod.to)
+  }, [collectionsHistory, collRangeForPeriod])
+
+  // daily_collections DOES still write a real zero-invoice row for a day
+  // that was genuinely checked and had nothing (unlike sales_history above),
+  // so _mergeCardRows' null-vs-empty-object distinction stays meaningful here.
+  const collDisplayData = useMemo(() => collRangeForPeriod ? _mergeCardRows(collCardDays) : null, [collCardDays, collRangeForPeriod])
+
   const sortedCollectionItems = useMemo(() => [...(collDisplayData?.items ?? [])].sort((a, b) => b.amount - a.amount), [collDisplayData])
   const collectionsHasDetail  = useMemo(() => sortedCollectionItems.some(i => i.customer_name || i.invoice_ref), [sortedCollectionItems])
+
+  // Last real receipt date, for the "Payments entered in Tally up to X"
+  // status line — derived from collectionsHistory now instead of a separate
+  // 30-day lookback query, since we already have the whole FY in memory.
+  const lastCollectionDate = useMemo(() => {
+    const cutoff = _addDaysISO(TODAY, -30)
+    const real = collectionsHistory
+      .filter(r => r.sale_date >= cutoff && r.sale_date <= TODAY && (r.invoice_count || 0) > 0)
+      .sort((a, b) => b.sale_date.localeCompare(a.sale_date))
+    return real.length ? real[0].sale_date : null
+  }, [collectionsHistory])
 
   // ── Customer detail derived values ─────────────────────────────────────────
   const {
@@ -1309,6 +1355,11 @@ export default function App() {
               Synced {new Date(lastSync.run_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}
             </div>
           )}
+          {auditFailed && (
+            <div className="audit-badge" title="backend/audit.py found a mismatch between Tally and Supabase — see the audit_results table">
+              Data check failed
+            </div>
+          )}
         </div>
         <button className="glass circle" onClick={() => setMenuOpen(v => !v)} aria-label="Options" aria-haspopup="true" aria-expanded={menuOpen}>
           <Icon.more />
@@ -1332,10 +1383,10 @@ export default function App() {
         <OverviewPage
           summary={summary} presentRatio={presentRatio} agingTotal={agingTotal}
           salesCardPeriod={salesCardPeriod} salesPickerOpen={salesPickerOpen} salesCustomDate={salesCustomDate}
-          salesCardLoading={salesCardLoading} salesDisplayData={salesDisplayData} salesHasDetail={salesHasDetail}
+          salesDisplayData={salesDisplayData} salesHasDetail={salesHasDetail} syncedToday={syncedToday}
           visibleSalesItems={visibleSalesItems} sortedSalesItems={sortedSalesItems} showAllSales={showAllSales}
           collCardPeriod={collCardPeriod} collPickerOpen={collPickerOpen} collCustomDate={collCustomDate}
-          collCardLoading={collCardLoading} collDisplayData={collDisplayData} collectionsHasDetail={collectionsHasDetail}
+          collDisplayData={collDisplayData} collectionsHasDetail={collectionsHasDetail}
           sortedCollectionItems={sortedCollectionItems}
           lastCollectionDate={lastCollectionDate} collectionsStale={collectionsStale}
           staffSummary={staffSummary} maxStaffPending={maxStaffPending}
