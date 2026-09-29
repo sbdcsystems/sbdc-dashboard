@@ -202,10 +202,15 @@ button.item:active{background:var(--fill)}
 .empty{padding:26px 16px;text-align:center;color:var(--label2);font-size:14px}
 
 /* ---------- Tab bar ---------- */
-.tabbar{position:fixed;z-index:30;left:0;right:0;bottom:14px;display:flex;justify-content:center;align-items:center;gap:10px}
+.tabbar{position:fixed;z-index:30;left:0;right:0;bottom:14px;display:flex;justify-content:center;align-items:center;gap:8px}
 .tabbar-tabs{display:flex;border-radius:999px;padding:4px;gap:2px}
-.tabbar-tabs button{display:flex;align-items:center;gap:6px;min-width:0;padding:8px 16px;border-radius:999px;font-size:13px;font-weight:600;color:var(--label);position:relative;z-index:2;transition:background .25s,color .25s}
-.tabbar-tabs button svg{width:18px;height:18px}
+/* Padding sized so 3 tabs fit narrow phones (375/390px) with the search
+   circle and >=12px margin either side — 14px vertical padding + the 16px
+   icon hits exactly the 44px min tap-target height, while horizontal
+   padding/font/icon size shrank to save width (29-Sep-2026 tab-bar-overflow
+   fix; measured via Playwright at 375/390/1280px, no overflow at any). */
+.tabbar-tabs button{display:flex;align-items:center;gap:5px;min-width:0;padding:14px 10px;border-radius:999px;font-size:12px;font-weight:600;color:var(--label);position:relative;z-index:2;transition:background .25s,color .25s}
+.tabbar-tabs button svg{width:16px;height:16px}
 .tabbar-tabs button[aria-pressed="true"]{color:var(--blue);background:var(--fill)}
 
 /* ---------- Sheet ---------- */
