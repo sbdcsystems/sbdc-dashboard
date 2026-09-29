@@ -4,6 +4,7 @@ import {
   ResponsiveContainer, CartesianGrid,
 } from 'recharts'
 import { supabase } from './lib/supabaseClient'
+import CollectTab from './CollectTab'
 import './App.css'
 
 // Bucket config
@@ -1297,7 +1298,7 @@ export default function App() {
 
   const agingTotal = useMemo(() => summary ? summary.bucketChartData.reduce((s, b) => s + b.total, 0) : 0, [summary])
 
-  const pageTitle = view === 'customers' ? 'Customers' : 'Summary'
+  const pageTitle = view === 'customers' ? 'Customers' : view === 'collect' ? 'Collect' : 'Summary'
   // Call prefers mobile (LEDGERMOBILE) and falls back to phone (LEDGERPHONE —
   // landline or mobile); WhatsApp needs a real mobile, so mobile only.
   const custCallHref = telHref(selectedCustomer?.mobile || selectedCustomer?.phone)
@@ -1436,12 +1437,22 @@ export default function App() {
         <p className="sf">{filteredCustomers.length} of {staffFilteredCustomers.length} customers{staffFilter && ` · ${staffFilter}`}</p>
       </main>
 
+      {/* ── Collect page — additive, self-contained (see CollectTab.jsx) ── */}
+      <CollectTab
+        customers={customers}
+        onOpenCustomer={openCustomer}
+        lastCollectionDate={lastCollectionDate}
+        active={view === 'collect'}
+        hidden={loading || !!error || view !== 'collect'}
+      />
+
       <div className="edge-bottom" aria-hidden="true"></div>
 
       <nav className="tabbar" aria-label="Sections">
         <div className="tabbar-tabs glass">
           <button aria-pressed={view === 'overview'} onClick={() => setView('overview')}><Icon.chart />Overview</button>
           <button aria-pressed={view === 'customers'} onClick={() => setView('customers')}><Icon.people />Customers</button>
+          <button aria-pressed={view === 'collect'} onClick={() => setView('collect')}><Icon.warn />Collect</button>
         </div>
         <button className="glass circle" aria-label="Search customers or staff" onClick={() => setSearchOpen(true)}>
           <Icon.search />
